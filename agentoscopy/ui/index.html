@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agentoscopy</title>
+  <link rel="stylesheet" href="/ui/app.css">
+  <script type="module" src="/ui/app.js"></script>
+</head>
+<body>
+  <header class="bar">
+    <a class="brand" href="#/runs">Agentoscopy</a>
+    <nav aria-label="Main"><a href="#/runs">Runs</a></nav>
+    <button id="theme" type="button" aria-label="Color theme: system">Theme: system</button>
+  </header>
+  <main id="view" tabindex="-1" aria-live="polite"></main>
+  <div id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

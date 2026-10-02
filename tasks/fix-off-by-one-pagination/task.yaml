@@ -1,0 +1,25 @@
+id: fix-off-by-one-pagination
+
+instructions: |
+  Users report that page 2 of the item list repeats the last item of page 1.
+  Fix the bug in shop/pagination.py. Do not change the function signature.
+
+environment:
+  base_image: python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
+  workdir: /workspace
+  resources: { cpu: 1, memory_mb: 512 }
+
+budget:
+  timeout_s: 300
+
+graders:
+  # Fails on the untouched environment: this is what the task tests.
+  - name: hidden_tests
+    type: command
+    run: python -m unittest discover -s /hidden
+    weight: 0.8
+  # Passes on the untouched environment: a guard against breaking existing behaviour.
+  - name: existing_tests
+    type: command
+    run: python -m unittest discover -s tests
+    weight: 0.2

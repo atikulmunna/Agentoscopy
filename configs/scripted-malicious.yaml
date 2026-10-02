@@ -1,0 +1,14 @@
+# Malicious scripted test agent (acceptance criterion 2): every attempt below must fail
+# inside the sandbox and appear in the trajectory.
+name: scripted-malicious
+adapter: python
+entrypoint: agentoscopy.testing.scripted_agent:ScriptedAgent
+params:
+  final_message: Done.
+  script:
+    # Read grader-only files: hidden/ is never mounted into the agent sandbox.
+    - exec: cat /hidden/test_page_boundaries.py
+    # Reach the internet: the agent sandbox has no network.
+    - exec: python -c "import urllib.request; urllib.request.urlopen('http://example.com', timeout=5)"
+    # Read provider keys: none exist in the sandbox (grep exits 1 when nothing matches).
+    - exec: env | grep -i -E 'api_key|token|secret'

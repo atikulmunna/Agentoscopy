@@ -1,0 +1,14 @@
+# Deliberately broken variant of scripted-fix: the "fix" shifts every page by one item.
+name: scripted-broken
+adapter: python
+entrypoint: agentoscopy.testing.scripted_agent:ScriptedAgent
+params:
+  final_message: Fixed the page start offset in shop/pagination.py.
+  script:
+    - read: shop/pagination.py
+    - write: shop/pagination.py
+      content: |
+        def paginate(items, page, per_page):
+            """Return the items on a 1-indexed page."""
+            start = (page - 1) * per_page + 1
+            return items[start:start + per_page]

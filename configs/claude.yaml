@@ -1,0 +1,8 @@
+# Example model-backed agent. Needs ANTHROPIC_API_KEY when running `agentoscopy run`; the key stays
+# in the credential proxy process and never reaches agent code.
+name: claude-opus
+adapter: python
+entrypoint: agentoscopy.adapters.examples.claude_agent:ClaudeAgent
+params:
+  model: claude-opus-5-5
+  effort: high

@@ -1,0 +1,3 @@
+name: example
+tasks:
+  - fix-off-by-one-pagination

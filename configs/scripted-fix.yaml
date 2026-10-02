@@ -1,0 +1,18 @@
+# Well-behaved scripted test agent: "plans" with two mock model calls (through the gateway),
+# then applies the correct fix to the example task.
+name: scripted-fix
+adapter: python
+entrypoint: agentoscopy.testing.scripted_agent:ScriptedAgent
+params:
+  final_message: Fixed the page start offset in shop/pagination.py.
+  script:
+    - model_calls: 2
+      prompt: Plan a fix for the pagination bug.
+    - read: shop/pagination.py
+    - write: shop/pagination.py
+      content: |
+        def paginate(items, page, per_page):
+            """Return the items on a 1-indexed page."""
+            start = (page - 1) * per_page
+            return items[start:start + per_page]
+    - exec: python -m unittest discover -s tests
