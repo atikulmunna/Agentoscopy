@@ -142,7 +142,7 @@ def test_trial_detail_paginated_trajectory_and_diff(world):
     assert [attempt["attempt"] for attempt in trial["attempts"]] == [1]
     assert page["total"] > 3 and len(page["events"]) == 2
     assert page["events"][0]["seq"] == 1
-    assert diff["diff"] == "C app.py"
+    assert diff["diff"] == "A /workspace/app.py"
     assert (status, bad["error"]["code"]) == (400, "BAD_REQUEST")
 
 

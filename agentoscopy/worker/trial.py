@@ -16,6 +16,8 @@ from agentoscopy.adapters.base import AgentAdapter, TaskContext
 from agentoscopy.gateway.server import Gateway
 from agentoscopy.gateway.session import TrialSession, Usage
 from agentoscopy.graders.base import GraderError, GradeResult
+from agentoscopy.graders.fsdiff import since_baseline
+from agentoscopy.graders.judge import GatewayJudge
 from agentoscopy.graders.pipeline import grade_snapshot
 from agentoscopy.recorder.trajectory import TrajectoryRecorder, read_events
 from agentoscopy.sandbox.base import ManagedSandbox, SandboxBackend, SandboxError
@@ -61,6 +63,7 @@ class AttemptSpec:
     seed_key: str
     image_digest: str | None = None
     verified_graders: frozenset[str] = frozenset()
+    judge_model: str | None = None  # pinned per run; used only by llm_judge graders
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,8 @@ class AttemptResult:
     duration_s: float
     trajectory_path: Path
     final_state_path: Path | None
+    vetoed: bool = False  # tamper_check failed: reward hacking (FR-GRD-07)
+    judge_cost_usd: float = 0.0  # tracked apart from agent spend (NFR-COST-02)
 
     @property
     def retryable(self) -> bool:
@@ -89,6 +94,7 @@ class _Resources:
     sandboxes: list[ManagedSandbox] = field(default_factory=list)
     session: TrialSession | None = None
     final_state_path: Path | None = None
+    judge: GatewayJudge | None = None
 
 
 @dataclass
@@ -99,6 +105,7 @@ class _Outcome:
     grades: list[GradeResult] = field(default_factory=list)
     error_code: str | None = None
     error: str | None = None
+    vetoed: bool = False
 
 
 def attempt_paths(output_root: Path, run_id: str, trial_id: str, attempt: int) -> tuple[Path, Path]:
@@ -133,9 +140,12 @@ async def run_attempt(
             cleanup_errors = await _destroy(resources.sandboxes, recorder)
         duration_s = round(time.monotonic() - started, 3)
         usage = resources.session.usage if resources.session else Usage()
-        recorder.write("trial_end", _end_payload(outcome, usage, duration_s))
+        judge_cost = resources.judge.cost_usd if resources.judge else 0.0
+        recorder.write("trial_end", _end_payload(outcome, usage, duration_s, judge_cost))
     finally:
         recorder.close()
+        if resources.judge:
+            resources.judge.close()
     return AttemptResult(
         outcome=outcome.outcome,
         termination=outcome.termination,
@@ -148,6 +158,8 @@ async def run_attempt(
         duration_s=duration_s,
         trajectory_path=trajectory_path,
         final_state_path=resources.final_state_path,
+        vetoed=outcome.vetoed,
+        judge_cost_usd=judge_cost,
     )
 
 
@@ -170,6 +182,7 @@ async def _execute(
     sandbox = await backend.create(image, task, spec.trial_id)
     resources.sandboxes.append(sandbox)
     await run_setup(sandbox, task)
+    baseline = await sandbox.diff() if task.spec.environment.setup else ""
     session = gateway.open_session(spec.trial_id, task.spec.budget, recorder, spec.seed_key)
     resources.session = session
     on_state("RUNNING")
@@ -179,11 +192,12 @@ async def _execute(
         gateway.close_session(session)
     if session.provider_error:
         raise ProviderError(session.provider_error)
-    fs_diff = await sandbox.diff()
+    fs_diff = since_baseline(await sandbox.diff(), baseline)
     recorder.store_artifact("final_state.diff", fs_diff.encode())
     resources.final_state_path = recorder.artifacts_dir / "final_state.diff"
     await sandbox.stop()
     on_state("GRADING")
+    resources.judge = _judge(spec, gateway, recorder)
     graded = await grade_snapshot(
         backend,
         await sandbox.snapshot(),
@@ -194,8 +208,25 @@ async def _execute(
         trajectory=read_events(recorder.path),
         final_message=final_message,
         fs_diff=fs_diff,
+        judge=resources.judge,
     )
-    return _Outcome("pass" if graded.passed else "fail", termination, graded.score, graded.grades)
+    outcome = "pass" if graded.passed else "fail"
+    return _Outcome(outcome, termination, graded.score, graded.grades, vetoed=graded.vetoed)
+
+
+def _judge(
+    spec: AttemptSpec, gateway: Gateway, recorder: TrajectoryRecorder
+) -> GatewayJudge | None:
+    """A judge for this attempt's llm_judge graders, logging to its own grading file."""
+    if not spec.judge_model or not spec.task.spec.has_judges():
+        return None
+    grading_log = TrajectoryRecorder(
+        recorder.artifacts_dir / "grading.jsonl",
+        recorder.artifacts_dir / "grading",
+        spec.trial_id,
+        spec.attempt,
+    )
+    return GatewayJudge(gateway, spec.judge_model, grading_log, spec.seed_key)
 
 
 async def run_setup(sandbox: ManagedSandbox, task: Task) -> None:
@@ -302,7 +333,9 @@ def _start_payload(spec: AttemptSpec) -> dict[str, Any]:
     }
 
 
-def _end_payload(outcome: _Outcome, usage: Usage, duration_s: float) -> dict[str, Any]:
+def _end_payload(
+    outcome: _Outcome, usage: Usage, duration_s: float, judge_cost_usd: float
+) -> dict[str, Any]:
     return {
         "termination": outcome.termination,
         "outcome": outcome.outcome,
@@ -314,7 +347,9 @@ def _end_payload(outcome: _Outcome, usage: Usage, duration_s: float) -> dict[str
             "cache_read_tokens": usage.cache_read_tokens,
             "cache_write_tokens": usage.cache_write_tokens,
             "cost_usd": round(usage.cost_usd, 8),
+            "judge_cost_usd": round(judge_cost_usd, 8),
         },
+        "vetoed": outcome.vetoed,
         "error_code": outcome.error_code,
         "error": outcome.error,
     }

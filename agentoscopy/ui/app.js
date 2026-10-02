@@ -1,4 +1,4 @@
-// Agentoscopy web UI: hash-routed views over the read-only REST API.
+// Agentoscopy web UI: hash-routed views over the REST API.
 // Everything shown comes from runs and agents, so it is untrusted text: values reach the DOM
 // through textContent (the `h` helper), never through innerHTML.
 
@@ -35,11 +35,31 @@ const EVENT_GROUPS = {
   messages: ["agent_message"],
   problems: ["error", "budget_warning"],
 };
+const KIND_LABEL = {
+  deterministic: "Command",
+  trajectory: "Trajectory",
+  tamper: "Tamper check",
+  judge: "LLM judge",
+  custom: "Custom",
+};
+const SOURCE_LABEL = {
+  low_confidence: "Low judge confidence",
+  random: "Random sample",
+  manual: "Added by hand",
+};
+const CALIBRATION_LABEL = {
+  calibrated: "Calibrated",
+  uncalibrated: "Uncalibrated",
+  insufficient_data: "Needs more reviews",
+  undefined: "Undefined",
+};
 
 const view = document.getElementById("view");
 const tooltip = document.getElementById("tooltip");
 let token = stored(TOKEN_KEY);
 let refreshCurrent = null; // set by a view that wants live updates
+let keyHandler = null; // set by a view that takes single-key shortcuts
+const skippedReviews = new Set(); // review items skipped during this visit
 
 // ---------------------------------------------------------------- basics
 
@@ -81,8 +101,10 @@ function svg(tag, attrs = {}, ...children) {
   return node;
 }
 
-async function api(path) {
-  const response = await fetch(path, { headers: { Authorization: `Bearer ${token || ""}` } });
+async function api(path, { method = "GET", body: payload } = {}) {
+  const headers = { Authorization: `Bearer ${token || ""}` };
+  if (payload !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, { method, headers, body: payload === undefined ? undefined : JSON.stringify(payload) });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(body.error?.message || `The server answered ${response.status}.`);
@@ -103,6 +125,8 @@ const shortId = (id) => String(id).slice(0, 8);
 const when = (iso) => (iso ? new Date(iso).toLocaleString() : "");
 const json = (value) => JSON.stringify(value, null, 2);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const verdictText = (passed) => (passed ? "Pass" : "Fail");
+const sentence = (text) => `${text[0].toUpperCase()}${text.slice(1)}${/[.!?]$/.test(text) ? "" : "."}`;
 
 function groupBy(items, key) {
   const groups = new Map();
@@ -367,14 +391,28 @@ async function runView(runId) {
         String(counts.pass + counts.fail),
         `${counts.pass} pass, ${counts.fail} fail; ${counts.infra_error} infra error, ${counts.skipped + counts.cancelled} not run`,
       ),
-      stat("Cost", usd(summary.total_cost_usd, 2), summary.cost_per_pass_usd == null ? "No passes" : `${usd(summary.cost_per_pass_usd)} per pass`),
+      stat("Cost", usd(summary.total_cost_usd, 2), costNote(summary)),
       stat("Flaky tasks", String(summary.flaky_tasks.length), summary.flaky_tasks.length ? summary.flaky_tasks.join(", ") : "Every task gave consistent results"),
     ),
+    summary.uncalibrated_judges?.length
+      ? h(
+          "div",
+          { class: "notice" },
+          h("strong", {}, "Uncalibrated judges. "),
+          `Human reviewers often disagree with ${summary.uncalibrated_judges.join(", ")}, so pass rates that depend on them may be wrong. `,
+          h("a", { href: "#/calibration" }, "See calibration"),
+        )
+      : null,
     h("h2", {}, "Tasks"),
     wellLegend(),
     table(["Task", "Trials", "Pass rate", "Passes", `pass@${k}`, `pass^${k}`, "Cost per trial", "Steps"], taskRows, [3, 4, 5, 6, 7]),
     sliceSections(summary.slices, "Mean pass rate", (value) => h("span", { class: "bar-cell" }, magnitude(value), pct(value))),
   ];
+}
+
+function costNote(summary) {
+  const perPass = summary.cost_per_pass_usd == null ? "No passes" : `${usd(summary.cost_per_pass_usd)} per pass`;
+  return summary.judge_cost_usd ? `${perPass}; judging ${usd(summary.judge_cost_usd)} more` : perPass;
 }
 
 function sliceSections(slices, valueLabel, renderValue) {
@@ -534,8 +572,10 @@ function matches(event, group, query) {
 async function trialView(trialId) {
   const trial = await api(`/trials/${enc(trialId)}`);
   const tokens = trial.input_tokens == null ? "n/a" : String(trial.input_tokens + trial.output_tokens);
+  const outcome = OUTCOME_LABEL[wellKind(trial)] || trial.outcome;
+  const overridden = trial.original_outcome && trial.original_outcome !== trial.outcome;
   const facts = [
-    ["Outcome", OUTCOME_LABEL[wellKind(trial)] || trial.outcome],
+    ["Outcome", overridden ? `${outcome} (set by a reviewer; graders said ${OUTCOME_LABEL[trial.original_outcome]})` : outcome],
     ["Termination", trial.termination || "n/a"],
     ["Score", trial.score == null ? "n/a" : trial.score.toFixed(2)],
     ["Cost", usd(trial.cost_usd)],
@@ -543,17 +583,23 @@ async function trialView(trialId) {
     ["Tokens", tokens],
     ["Duration", trial.duration_s == null ? "n/a" : `${trial.duration_s.toFixed(1)} s`],
   ];
+  const reviewable = trial.outcome === "pass" || trial.outcome === "fail";
   const graders = trial.grades.map((grade) =>
     h(
       "div",
       { class: "grader" },
-      h("span", { class: `outcome ${grade.passed ? "pass" : "fail"}` }, grade.passed ? "Pass" : "Fail"),
+      h("span", { class: `outcome ${grade.passed ? "pass" : "fail"}` }, verdictText(grade.passed)),
       " ",
       h("strong", {}, grade.grader_name),
+      " ",
+      h("span", { class: "class-tag" }, KIND_LABEL[grade.kind] || grade.kind),
       grade.metadata?.grader_error ? h("span", { class: "muted" }, " (the grader itself failed on this state)") : null,
+      grade.kind === "judge" ? judgeDetails(grade.metadata) : null,
       pre(grade.rationale),
+      grade.kind === "judge" && reviewable ? h("div", { class: "toolbar" }, queueButton(trial.trial_id, grade.grader_name, "Review this verdict")) : null,
     ),
   );
+  const vetoed = trial.grades.some((grade) => grade.kind === "tamper" && !grade.passed);
   const panes = {
     timeline: () => trajectoryPane(trial),
     diff: () => diffPane(trial),
@@ -570,11 +616,48 @@ async function trialView(trialId) {
       trial.attempt > 1 ? `. Attempt ${trial.attempt}; earlier attempts ended in infra errors and were retried.` : ".",
     ),
     h("div", { class: "facts" }, facts.map(([label, value]) => h("span", {}, `${label} `, h("b", {}, String(value))))),
+    trial.failure_tags.length
+      ? h("div", { class: "tags" }, h("span", { class: "muted" }, "Failure tags"), trial.failure_tags.map((tag) => h("span", { class: "class-tag", title: `Added by ${tag.source}` }, tag.tag.replaceAll("_", " "))))
+      : null,
     trial.error_code ? h("div", { class: "notice" }, h("strong", {}, trial.error_code), " ", trial.error) : null,
+    vetoed
+      ? h(
+          "div",
+          { class: "notice critical" },
+          h("strong", {}, "Vetoed. "),
+          "The tamper check found changes outside the allowed paths or to protected files, so the trial fails whatever the other graders said.",
+        )
+      : null,
     h("h2", {}, "Graders"),
     graders.length ? h("div", { class: "graders" }, graders) : h("p", { class: "muted" }, "This trial was not graded."),
+    reviewable ? h("div", { class: "toolbar" }, queueButton(trial.trial_id, null, "Add to review queue")) : null,
     tabs,
   ];
+}
+
+function judgeDetails(metadata = {}) {
+  const parts = [
+    metadata.judge_model,
+    metadata.confidence == null ? null : `confidence ${metadata.confidence.toFixed(2)}`,
+    metadata.votes > 1 ? plural(metadata.votes, "vote") : null,
+  ].filter(Boolean);
+  return parts.length ? h("span", { class: "muted" }, ` ${parts.join(", ")}`) : null;
+}
+
+function queueButton(trialId, graderName, label) {
+  const button = h("button", { type: "button" }, label);
+  const result = h("span", { class: "muted", role: "status" });
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api("/review/queue", { method: "POST", body: { trial_id: trialId, grader_name: graderName } });
+      result.textContent = "Added to the review queue.";
+    } catch (error) {
+      result.textContent = sentence(error.message);
+      button.disabled = error.status === 409;
+    }
+  });
+  return [button, result];
 }
 
 function tabSet(tabs, panes) {
@@ -793,6 +876,217 @@ async function sideView(leftId, rightId) {
   ];
 }
 
+// ---------------------------------------------------------------- review queue
+
+async function reviewView() {
+  keyHandler = null; // the previous item's shortcuts must not act on whatever shows next
+  // Enough items that one is left after the ones skipped this visit.
+  const limit = Math.min(skippedReviews.size + 1, 100);
+  const { pending, items } = await api(`/review/queue?limit=${limit}`);
+  const item = items.find((candidate) => !skippedReviews.has(candidate.review_id));
+  if (!item) return reviewEmpty(pending);
+
+  const score = h("input", { type: "number", id: "review-score", min: 0, max: 1, step: 0.05, inputmode: "decimal" });
+  const note = h("textarea", { id: "review-note", rows: 2, maxlength: 2000 });
+  const override = h("input", { type: "checkbox", id: "review-override" });
+  const pass = h("button", { type: "button", class: "verdict-button pass" }, "Pass", h("kbd", {}, "p"));
+  const fail = h("button", { type: "button", class: "verdict-button fail" }, "Fail", h("kbd", {}, "f"));
+  const skip = h("button", { type: "button" }, "Skip", h("kbd", {}, "s"));
+  const outcome = h("div", { class: "reveal", role: "status" });
+  let submitted = false;
+  const next = () => render(reviewView);
+
+  async function submit(passed) {
+    if (submitted) return;
+    const scoreValue = score.value === "" ? null : Number(score.value);
+    if (scoreValue != null && !(scoreValue >= 0 && scoreValue <= 1)) {
+      outcome.replaceChildren(h("div", { class: "error-state" }, "Score must be a number from 0 to 1."));
+      return;
+    }
+    submitted = true;
+    for (const button of [pass, fail, skip]) button.disabled = true;
+    try {
+      const body = { passed, score: scoreValue, note: note.value.trim() || null, override: override.checked };
+      const result = await api(`/review/${enc(item.review_id)}`, { method: "POST", body });
+      const nextButton = h("button", { type: "button", class: "primary" }, "Next item", h("kbd", {}, "n"));
+      nextButton.addEventListener("click", next);
+      outcome.replaceChildren(...revealed(item, passed, result), h("div", { class: "toolbar" }, nextButton));
+      nextButton.focus();
+    } catch (error) {
+      submitted = error.status === 409; // already reviewed elsewhere: nothing left to submit
+      for (const button of [pass, fail, skip]) button.disabled = submitted;
+      outcome.replaceChildren(errorState(error));
+    }
+  }
+  function skipItem() {
+    if (submitted) return;
+    skippedReviews.add(item.review_id);
+    next();
+  }
+  pass.addEventListener("click", () => submit(true));
+  fail.addEventListener("click", () => submit(false));
+  skip.addEventListener("click", skipItem);
+  keyHandler = (key) => {
+    if (key === "p") submit(true);
+    else if (key === "f") submit(false);
+    else if (key === "s") skipItem();
+    else if (key === "n" && submitted) next();
+    else return false;
+    return true;
+  };
+
+  const question = item.grader_name
+    ? [
+        h("p", { class: "lede" }, `Answer the rubric of the judge grader ${item.grader_name}, not whether the whole trial passed. The judge's verdict stays hidden until you submit.`),
+        h("h2", {}, "Rubric"),
+        pre(item.rubric || "(The rubric could not be found.)"),
+      ]
+    : [h("p", { class: "lede" }, "Trial audit: did the agent do what the task asked? The graders' verdict stays hidden until you submit.")];
+  return [
+    h("h1", {}, `Review: ${item.task_id}`),
+    h(
+      "div",
+      { class: "tags" },
+      h("span", { class: "class-tag" }, SOURCE_LABEL[item.sample_source] || item.sample_source),
+      h("span", { class: "muted" }, `${plural(pending, "item")} waiting, run ${shortId(item.run_id)}`),
+    ),
+    question,
+    h("h2", {}, "Task"),
+    pre(item.instructions || "(The task instructions could not be found.)"),
+    h("h2", {}, "Final message from the agent"),
+    pre(item.final_message || "(none)"),
+    h("h2", {}, "Files changed"),
+    item.changed_files.length
+      ? h("div", { class: "panel diff code" }, item.changed_files.map((line) => h("div", { class: line[0] }, line)))
+      : h("p", { class: "muted" }, "The agent changed no files."),
+    h("h2", {}, "What the agent did"),
+    pre(item.actions.length ? item.actions.join("\n") : "(no actions)"),
+    h(
+      "div",
+      { class: "decide" },
+      h(
+        "div",
+        { class: "fields" },
+        h("label", { for: "review-score" }, "Score (optional, 0 to 1)", score),
+        h("label", { for: "review-note", class: "grow" }, "Note (optional)", note),
+        h("label", { for: "review-override", class: "check" }, override, "Also set the trial's outcome to my verdict"),
+      ),
+      h("div", { class: "toolbar" }, pass, fail, skip),
+      outcome,
+    ),
+  ];
+}
+
+function revealed(item, passed, result) {
+  const parts = [];
+  if (result.judge) {
+    const agreed = result.judge.passed === passed;
+    const confidence = result.judge.metadata?.confidence;
+    parts.push(
+      h(
+        "p",
+        {},
+        h("strong", {}, agreed ? "You agreed with the judge. " : "You disagreed with the judge. "),
+        `You said ${verdictText(passed)}; the judge said ${verdictText(result.judge.passed)}`,
+        confidence == null ? "." : ` with confidence ${confidence.toFixed(2)}.`,
+      ),
+      pre(result.judge.rationale),
+    );
+  } else {
+    const graded = result.original_outcome || result.outcome;
+    parts.push(h("p", {}, `You said ${verdictText(passed)}; the graders said ${OUTCOME_LABEL[graded] || graded}.`));
+  }
+  if (result.original_outcome && result.original_outcome !== result.outcome) {
+    parts.push(h("p", {}, `The trial's outcome is now ${OUTCOME_LABEL[result.outcome]}, set by a reviewer.`));
+  }
+  parts.push(h("p", {}, h("a", { href: `#/trials/${enc(item.trial_id)}` }, "Open the trial")));
+  return parts;
+}
+
+function reviewEmpty(pending) {
+  if (!pending) {
+    return [
+      h("h1", {}, "Review"),
+      h(
+        "p",
+        { class: "lede" },
+        "The review queue is empty. Runs add trials to it at random (5% by default, set with ",
+        h("code", {}, "--review-rate"),
+        ") and whenever an LLM judge is unsure. You can also add a trial from its page.",
+      ),
+    ];
+  }
+  const again = h("button", { type: "button" }, "Show skipped items again");
+  again.addEventListener("click", () => {
+    skippedReviews.clear();
+    render(reviewView);
+  });
+  return [h("h1", {}, "Review"), h("p", { class: "lede" }, `You skipped all ${plural(pending, "remaining item")}.`), again];
+}
+
+// ---------------------------------------------------------------- judge calibration
+
+async function calibrationView() {
+  const { judges, kappa_threshold: threshold, min_reviews: minimum } = await api("/calibration");
+  const intro = h(
+    "p",
+    { class: "lede" },
+    `Agreement and Cohen's κ count only randomly sampled reviews. A judge is calibrated when κ reaches ${threshold} over at least ${minimum} of them. Low-confidence and hand-added reviews show up among the disagreements only.`,
+  );
+  if (!judges.length) return [h("h1", {}, "Judge calibration"), intro, h("p", { class: "muted" }, "No judge verdicts have been reviewed yet.")];
+  const status = (judge) => {
+    const label = CALIBRATION_LABEL[judge.status] || judge.status;
+    if (judge.status === "insufficient_data") return `${label} (${judge.random_reviews} of ${minimum})`;
+    if (judge.status === "undefined") return `${label}: one side gave a single answer throughout`;
+    return label;
+  };
+  const rows = judges.map((judge) =>
+    h(
+      "tr",
+      {},
+      h("td", {}, judge.task_id),
+      h("td", {}, judge.grader_name),
+      h("td", {}, h("span", { class: `status-tag ${judge.status}` }, status(judge))),
+      h("td", { class: "num" }, judge.kappa == null ? "n/a" : judge.kappa.toFixed(2)),
+      h("td", { class: "num" }, pct(judge.agreement)),
+      h("td", { class: "num" }, String(judge.random_reviews)),
+      h("td", {}, judge.judge_model || "n/a"),
+    ),
+  );
+  return [
+    h("h1", {}, "Judge calibration"),
+    intro,
+    table(["Task", "Grader", "Status", "κ", "Agreement", "Random reviews", "Judge model"], rows, [3, 4, 5]),
+    judges.map(judgeDetail),
+  ];
+}
+
+function judgeDetail(judge) {
+  const c = judge.confusion;
+  const matrix = table(
+    ["", "Judge said Pass", "Judge said Fail"],
+    [
+      h("tr", {}, h("th", { scope: "row" }, "Human said Pass"), h("td", { class: "num" }, String(c.human_pass_judge_pass)), h("td", { class: "num" }, String(c.human_pass_judge_fail))),
+      h("tr", {}, h("th", { scope: "row" }, "Human said Fail"), h("td", { class: "num" }, String(c.human_fail_judge_pass)), h("td", { class: "num" }, String(c.human_fail_judge_fail))),
+    ],
+    [1, 2],
+  );
+  const disagreements = judge.disagreements.map((row) =>
+    h(
+      "li",
+      {},
+      h("a", { href: `#/trials/${enc(row.trial_id)}` }, `Trial ${shortId(row.trial_id)}`),
+      `: human ${verdictText(row.human_passed)}, judge ${verdictText(row.judge_passed)} `,
+      h("span", { class: "muted" }, `(${(SOURCE_LABEL[row.sample_source] || row.sample_source).toLowerCase()})`),
+    ),
+  );
+  return [
+    h("h2", {}, `${judge.task_id} / ${judge.grader_name}`),
+    h("div", { class: "matrix" }, matrix),
+    disagreements.length ? h("ul", { class: "disagreements" }, disagreements) : h("p", { class: "muted" }, "No disagreements."),
+  ];
+}
+
 // ---------------------------------------------------------------- routing and setup
 
 const ROUTES = [
@@ -801,6 +1095,8 @@ const ROUTES = [
   [/^#\/trials\/([^/]+)$/, (id) => trialView(id)],
   [/^#\/compare\/([^/]+)\/([^/]+)$/, (a, b) => compareView(a, b)],
   [/^#\/side\/([^/]+)\/([^/]+)$/, (a, b) => sideView(a, b)],
+  [/^#\/review\/?$/, () => reviewView()],
+  [/^#\/calibration\/?$/, () => calibrationView()],
 ];
 
 async function render(build, { keepFocus = false } = {}) {
@@ -827,6 +1123,7 @@ function takeToken() {
 function route() {
   takeToken();
   refreshCurrent = null;
+  keyHandler = null;
   tooltip.hidden = true;
   const hash = location.hash || "#/runs";
   for (const [pattern, build] of ROUTES) {
@@ -866,10 +1163,13 @@ document.getElementById("theme").addEventListener("click", () => {
 });
 document.addEventListener("keydown", (event) => {
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
+  if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
   const search = document.querySelector('input[type="search"]');
-  if (event.key === "/" && !typing && search) {
+  if (event.key === "/" && search) {
     event.preventDefault();
     search.focus();
+  } else if (keyHandler?.(event.key)) {
+    event.preventDefault();
   }
 });
 window.addEventListener("hashchange", route);

@@ -1,4 +1,4 @@
-"""REST API (§7.2) and web UI host (§7.5): read-only views of runs, trials, and comparisons.
+"""REST API (§7.2) and web UI host (§7.5): runs, trials, comparisons, and human review.
 
 Every API route needs the server's token (`Authorization: Bearer <token>`; `/events` also
 accepts `?token=`, since browsers cannot set headers on an EventSource). Requests must name a
@@ -18,8 +18,17 @@ from typing import Any
 from aiohttp import web
 from yarl import URL
 
+from agentoscopy.api import reviews
+from agentoscopy.api.common import (
+    ALLOWED_HOSTS,
+    HOME,
+    STORE,
+    TOKEN,
+    ApiError,
+    int_query,
+)
 from agentoscopy.recorder.trajectory import read_events
-from agentoscopy.reporting import NotFound, comparison, run_summary
+from agentoscopy.reporting import NotFound, comparison, run_summary, safe_artifact
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.storage.store import Store
 
@@ -30,18 +39,7 @@ MAX_PAGE = 5000
 EVENT_POLL_S = 1.0
 EVENT_HEARTBEAT_S = 15.0
 
-STORE = web.AppKey("store", Store)
-HOME = web.AppKey("home", Path)
-TOKEN = web.AppKey("token", str)
-ALLOWED_HOSTS = web.AppKey("allowed_hosts", frozenset)
-
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str) -> None:
-        super().__init__(message)
-        self.status, self.code = status, code
 
 
 def create_app(
@@ -61,6 +59,7 @@ def create_app(
     app.router.add_get("/trials/{trial_id}/diff", _get_diff)
     app.router.add_get("/compare", _compare)
     app.router.add_get("/events", _events)
+    reviews.add_routes(app)
     return app
 
 
@@ -126,13 +125,13 @@ async def _get_trial(request: web.Request) -> web.Response:
 
 async def _get_trajectory(request: web.Request) -> web.Response:
     trial = _trial(request)
-    attempt = _int_query(request, "attempt", trial["attempt"])
-    offset = _int_query(request, "offset", 0)
-    limit = min(_int_query(request, "limit", DEFAULT_PAGE), MAX_PAGE)
+    attempt = int_query(request, "attempt", trial["attempt"])
+    offset = int_query(request, "offset", 0)
+    limit = min(int_query(request, "limit", DEFAULT_PAGE), MAX_PAGE)
     record = next((a for a in trial["attempts"] if a["attempt"] == attempt), None)
     if record is None or not record["trajectory_uri"]:
         raise ApiError(404, "NOT_FOUND", f"trial has no trajectory for attempt {attempt}")
-    events = read_events(_artifact_path(request, record["trajectory_uri"]))
+    events = read_events(_artifact(request, record["trajectory_uri"]))
     return web.json_response(
         {
             "attempt": attempt,
@@ -148,7 +147,7 @@ async def _get_diff(request: web.Request) -> web.Response:
     trial = _trial(request)
     if not trial["final_state_uri"]:
         raise ApiError(404, "NOT_FOUND", "trial has no final state diff")
-    path = _artifact_path(request, trial["final_state_uri"])
+    path = _artifact(request, trial["final_state_uri"])
     return web.json_response({"diff": path.read_text(encoding="utf-8")})
 
 
@@ -201,22 +200,11 @@ def _trial(request: web.Request) -> dict[str, Any]:
     return trial
 
 
-def _artifact_path(request: web.Request, uri: str) -> Path:
-    """Resolve a stored artifact path, refusing anything outside the Agentoscopy home directory."""
-    path = Path(uri).resolve()
-    if not path.is_relative_to(request.app[HOME]) or not path.is_file():
+def _artifact(request: web.Request, uri: str) -> Path:
+    path = safe_artifact(request.app[HOME], uri)
+    if path is None:
         raise ApiError(404, "NOT_FOUND", "artifact is missing or outside the Agentoscopy home")
     return path
-
-
-def _int_query(request: web.Request, name: str, default: int) -> int:
-    try:
-        value = int(request.query.get(name, default))
-    except ValueError as exc:
-        raise ApiError(400, "BAD_REQUEST", f"{name} must be an integer") from exc
-    if value < 0:
-        raise ApiError(400, "BAD_REQUEST", f"{name} must not be negative")
-    return value
 
 
 def _error(status: int, code: str, message: str) -> web.Response:

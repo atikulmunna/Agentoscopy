@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-from agentoscopy.graders.base import GraderError
+from agentoscopy.graders.base import GraderError, Judge
+from agentoscopy.graders.fsdiff import since_baseline
 from agentoscopy.graders.pipeline import GradingOutcome, grade_snapshot
 from agentoscopy.sandbox.base import HIDDEN_MOUNT, ManagedSandbox, SandboxBackend, SandboxError
 from agentoscopy.spec import Task
@@ -14,6 +15,7 @@ from agentoscopy.worker.trial import SetupError, run_setup
 CHECK_FAILURE_CODES = frozenset(
     {"GRADER_PASSES_EMPTY_ENV", "REFERENCE_FAILS", "HIDDEN_FILE_EXPOSED", "GRADER_UNSTABLE"}
 )
+JUDGE_VOTES = 3  # validation asks each judge three times and takes the majority (WF-01 A2)
 
 
 class ValidationFailed(Exception):
@@ -38,17 +40,23 @@ class ValidationReport:
         return self.error_code is None
 
 
-async def validate_task(task: Task, backend: SandboxBackend) -> ValidationReport:
+async def validate_task(
+    task: Task, backend: SandboxBackend, judge: Judge | None = None
+) -> ValidationReport:
+    """`judge` is required for tasks with llm_judge graders."""
     report = ValidationReport(task.spec.id, task.content_hash)
     sandboxes: list[ManagedSandbox] = []
+    grade = _Grader(task, backend, sandboxes, judge)
     try:
+        if task.spec.has_judges() and judge is None:
+            raise ValidationFailed("JUDGE_UNAVAILABLE", "this task has llm_judge graders")
         report.image_digest = await backend.prepare_image(task)
-        await _null_check(task, backend, report.image_digest, sandboxes)
-        report.verified_graders = await _reference_check(
-            task, backend, report.image_digest, sandboxes
-        )
+        await _null_check(task, backend, report.image_digest, grade)
+        report.verified_graders = await _reference_check(task, backend, report.image_digest, grade)
         if not task.reference_files():
             report.flags.append("NO_REFERENCE")
+        if all(g.type == "llm_judge" for g in task.spec.graders if g.required):
+            report.flags.append("SOFT_GRADER_ONLY")
         _host_isolation_check(task)
     except ValidationFailed as exc:
         report.error_code, report.message = exc.code, str(exc)
@@ -63,14 +71,12 @@ async def validate_task(task: Task, backend: SandboxBackend) -> ValidationReport
     return report
 
 
-async def _null_check(
-    task: Task, backend: SandboxBackend, image: str, sandboxes: list[ManagedSandbox]
-) -> None:
-    sandbox = await _fresh_sandbox(task, backend, image, sandboxes)
+async def _null_check(task: Task, backend: SandboxBackend, image: str, grade: _Grader) -> None:
+    sandbox, baseline = await _fresh_sandbox(task, backend, image, grade.sandboxes)
     probe = await sandbox.exec(f"test -e {HIDDEN_MOUNT}")
     if probe.exit_code == 0:
         raise ValidationFailed("HIDDEN_FILE_EXPOSED", f"{HIDDEN_MOUNT} exists in the agent sandbox")
-    graded = await _grade(task, backend, sandbox, sandboxes)
+    graded = await grade(sandbox, baseline)
     if graded.passed:
         raise ValidationFailed(
             "GRADER_PASSES_EMPTY_ENV",
@@ -79,16 +85,17 @@ async def _null_check(
 
 
 async def _reference_check(
-    task: Task, backend: SandboxBackend, image: str, sandboxes: list[ManagedSandbox]
+    task: Task, backend: SandboxBackend, image: str, grade: _Grader
 ) -> list[str]:
-    """Apply the reference solution and require a pass; returns the graders it verified."""
+    """Apply the reference solution and require a pass, tamper check included; returns the
+    graders it verified."""
     files = task.reference_files()
     if not files:
         return []
-    sandbox = await _fresh_sandbox(task, backend, image, sandboxes)
+    sandbox, baseline = await _fresh_sandbox(task, backend, image, grade.sandboxes)
     for file in files:
         await sandbox.write_file(file.relative_to(task.reference_dir).as_posix(), file.read_bytes())
-    graded = await _grade(task, backend, sandbox, sandboxes)
+    graded = await grade(sandbox, baseline)
     if not graded.passed:
         failing = [grade.name for grade in graded.grades if not grade.passed]
         raise ValidationFailed("REFERENCE_FAILS", f"reference solution fails graders: {failing}")
@@ -111,23 +118,39 @@ def _host_isolation_check(task: Task) -> None:
 
 async def _fresh_sandbox(
     task: Task, backend: SandboxBackend, image: str, sandboxes: list[ManagedSandbox]
-) -> ManagedSandbox:
+) -> tuple[ManagedSandbox, str]:
+    """A started sandbox after setup, and its post-setup diff baseline."""
     sandbox = await backend.create(image, task, f"validate-{task.spec.id}")
     sandboxes.append(sandbox)
     await run_setup(sandbox, task)
-    return sandbox
+    return sandbox, (await sandbox.diff() if task.spec.environment.setup else "")
 
 
-async def _grade(
-    task: Task, backend: SandboxBackend, sandbox: ManagedSandbox, sandboxes: list[ManagedSandbox]
-) -> GradingOutcome:
-    await sandbox.stop()
-    try:
-        return await grade_snapshot(
-            backend, await sandbox.snapshot(), task, f"validate-{task.spec.id}", sandboxes
-        )
-    except GraderError as exc:
-        raise ValidationFailed("GRADER_UNSTABLE", str(exc)) from exc
+@dataclass
+class _Grader:
+    """Grades a validation sandbox the way trials are graded, with majority-voting judges."""
+
+    task: Task
+    backend: SandboxBackend
+    sandboxes: list[ManagedSandbox]
+    judge: Judge | None
+
+    async def __call__(self, sandbox: ManagedSandbox, baseline: str) -> GradingOutcome:
+        fs_diff = since_baseline(await sandbox.diff(), baseline)
+        await sandbox.stop()
+        try:
+            return await grade_snapshot(
+                self.backend,
+                await sandbox.snapshot(),
+                self.task,
+                f"validate-{self.task.spec.id}",
+                self.sandboxes,
+                fs_diff=fs_diff,
+                judge=self.judge,
+                judge_votes=JUDGE_VOTES,
+            )
+        except GraderError as exc:
+            raise ValidationFailed("GRADER_UNSTABLE", str(exc)) from exc
 
 
 def _digest(data: bytes) -> str:

@@ -1,6 +1,6 @@
 """Task and agent config specs: schema validation, loading, and content hashing.
 
-Only the fields M0 enforces are accepted; unknown fields are rejected rather than ignored.
+Only fields the harness acts on are accepted; unknown fields are rejected, not ignored.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -76,13 +76,90 @@ class Budget(_Spec):
     timeout_s: int = Field(default=600, gt=0)  # excludes time spent in provider backoff
 
 
-class CommandGraderSpec(_Spec):
+class GraderSpecBase(_Spec):
+    """Fields every grader shares. `required` graders must pass; `weight` feeds the score."""
+
     name: str = Field(min_length=1)
-    type: Literal["command"]
-    run: str = Field(min_length=1)
     required: bool = True
     weight: float = Field(default=1.0, ge=0)
+
+
+class CommandGraderSpec(GraderSpecBase):
+    """Passes when a shell command exits 0 in the grading sandbox."""
+
+    type: Literal["command"]
+    run: str = Field(min_length=1)
     timeout_s: int = Field(default=300, gt=0)
+
+
+class ForbiddenCommandSpec(GraderSpecBase):
+    """Fails if any command the agent ran matches one of the regular expressions."""
+
+    type: Literal["forbidden_command"]
+    patterns: list[str] = Field(min_length=1)
+
+    @field_validator("patterns")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"{pattern!r} is not a valid regular expression: {exc}") from exc
+        return patterns
+
+
+class MustReadBeforeEditSpec(GraderSpecBase):
+    """Fails if the agent overwrote an existing file without reading it first."""
+
+    type: Literal["must_read_before_edit"]
+
+
+class MaxToolErrorsSpec(GraderSpecBase):
+    """Fails if more than `max` tool calls failed (non-zero exit, timeout, or error)."""
+
+    type: Literal["max_tool_errors"]
+    max: int = Field(ge=0)
+
+
+class MaxStepsSpec(GraderSpecBase):
+    """Fails if the agent made more than `max` model calls."""
+
+    type: Literal["max_steps"]
+    max: int = Field(gt=0)
+
+
+class TamperCheckSpec(GraderSpecBase):
+    """Fails, and vetoes the whole trial, if the agent changed files it must not touch.
+
+    Any change outside `allowed_paths` (default: the workdir and /tmp), or inside
+    `protected_paths`, counts. Paths are globs over absolute container paths.
+    """
+
+    type: Literal["tamper_check"]
+    allowed_paths: list[str] | None = None
+    protected_paths: list[str] = Field(default_factory=list)
+
+
+class LlmJudgeSpec(GraderSpecBase):
+    """A pinned model applies the rubric to the agent's final state (FR-GRD-05)."""
+
+    type: Literal["llm_judge"]
+    rubric: str = Field(min_length=1)
+    max_cost_usd: float = Field(default=0.25, gt=0)  # the judge's own budget, per trial
+    timeout_s: int = Field(default=180, gt=0)
+
+
+GraderSpec = Annotated[
+    CommandGraderSpec
+    | ForbiddenCommandSpec
+    | MustReadBeforeEditSpec
+    | MaxToolErrorsSpec
+    | MaxStepsSpec
+    | TamperCheckSpec
+    | LlmJudgeSpec,
+    Field(discriminator="type"),
+]
 
 
 class TaskSpec(_Spec):
@@ -94,7 +171,7 @@ class TaskSpec(_Spec):
     critical: bool = False  # a regression here fails a comparison outright (FR-TASK-09)
     environment: Environment
     budget: Budget = Field(default_factory=Budget)
-    graders: list[CommandGraderSpec] = Field(min_length=1)
+    graders: list[GraderSpec] = Field(min_length=1)
     aggregation: Literal["all_required_pass"] = "all_required_pass"
 
     @model_validator(mode="after")
@@ -105,6 +182,9 @@ class TaskSpec(_Spec):
         if not any(grader.required for grader in self.graders):
             raise ValueError("at least one grader must be required, otherwise every trial passes")
         return self
+
+    def has_judges(self) -> bool:
+        return any(grader.type == "llm_judge" for grader in self.graders)
 
 
 class AgentConfig(_Spec):

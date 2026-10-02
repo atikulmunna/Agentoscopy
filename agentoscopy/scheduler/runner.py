@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import socket
 import time
 from collections.abc import Callable
@@ -28,6 +29,8 @@ MAX_ATTEMPTS = 2  # infra retries (FR-EXE-07)
 RETRY_BACKOFF_S = 5.0
 IDLE_POLL_S = 1.0  # upper bound on how long an idle worker sleeps before re-checking
 TASK_FLAG_CODES = frozenset({"SETUP_BROKEN", "GRADER_UNSTABLE"})
+REVIEW_RATE = 0.05  # share of finished trials sampled at random for human review (FR-GRD-08)
+LOW_CONFIDENCE = 0.7  # judge verdicts below this confidence always go to review
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,8 @@ class RunExecutor:
         adapter_factory: AdapterFactory = load_python_adapter,
         on_progress: ProgressCallback | None = None,
         retry_backoff_s: float = RETRY_BACKOFF_S,
+        judge_model: str | None = None,
+        review_rate: float = REVIEW_RATE,
     ) -> None:
         self._store = store
         self._run_id = run_id
@@ -75,6 +80,8 @@ class RunExecutor:
         self._adapter_factory = adapter_factory
         self._on_progress = on_progress
         self._retry_backoff_s = retry_backoff_s
+        self._judge_model = judge_model
+        self._review_rate = review_rate
         self._changed = asyncio.Condition()
 
     async def execute(self) -> None:
@@ -133,6 +140,7 @@ class RunExecutor:
             seed_key=f"{self._seed}:{trial.task_id}:{trial.trial_index}",
             image_digest=pinned.image_digest,
             verified_graders=pinned.verified_graders,
+            judge_model=self._judge_model,
         )
         result = await run_attempt(
             spec,
@@ -148,7 +156,9 @@ class RunExecutor:
             result.outcome == "infra_error" and result.retryable and trial.attempt < MAX_ATTEMPTS
         )
         delay = self._retry_backoff_s * trial.attempt if retrying else None
-        self._store.finish_attempt(trial, worker_id, result, requeue_delay_s=delay)
+        finished = self._store.finish_attempt(trial, worker_id, result, requeue_delay_s=delay)
+        if finished and result.outcome in ("pass", "fail"):
+            self._after_grading(trial, result)
         if self._on_progress:
             finished, total = self._store.progress(self._run_id)
             self._on_progress(
@@ -163,3 +173,19 @@ class RunExecutor:
                     self._store.run_spent(self._run_id),
                 )
             )
+
+    def _after_grading(self, trial: ClaimedTrial, result: AttemptResult) -> None:
+        if result.vetoed:
+            self._store.add_failure_tag(
+                trial.trial_id, "reward_hacking", "auto", "tamper_check vetoed the trial"
+            )
+        judges = [grade for grade in result.grades if grade.kind == "judge"]
+        for grade in judges:
+            if grade.metadata.get("confidence", 1.0) < LOW_CONFIDENCE:
+                self._store.queue_review(
+                    trial.trial_id, trial.attempt, grade.name, "low_confidence"
+                )
+        # Seeded per trial, so the same run samples the same trials.
+        if random.Random(f"{self._seed}:review:{trial.trial_id}").random() < self._review_rate:
+            for name in [grade.name for grade in judges] or [""]:
+                self._store.queue_review(trial.trial_id, trial.attempt, name, "random")

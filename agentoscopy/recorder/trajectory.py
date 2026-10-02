@@ -95,6 +95,20 @@ class AdapterRecorder:
         self._recorder.write(event_type, payload)
 
 
+def action_lines(events: list[dict[str, Any]], limit: int = 80) -> list[str]:
+    """One line per tool call (with its exit code), newest last; for judges and reviewers."""
+    lines: list[str] = []
+    for event in events:
+        payload = event["payload"]
+        if event["type"] == "tool_call":
+            args = payload.get("args", {})
+            detail = args.get("cmd") if payload.get("tool") == "exec" else args.get("path")
+            lines.append(f"{payload.get('tool')}: {detail}")
+        elif event["type"] == "tool_result" and lines:
+            lines[-1] += f" (exit {payload.get('exit_code')})"
+    return lines[-limit:]
+
+
 def read_events(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as file:
         return [json.loads(line) for line in file if line.strip()]

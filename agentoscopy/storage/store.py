@@ -21,6 +21,8 @@ from agentoscopy.spec import AgentConfig, Task, config_hash
 from agentoscopy.worker.trial import AttemptResult
 
 IN_FLIGHT_STATES = ("PROVISIONING", "RUNNING", "GRADING")
+SCHEMA_VERSION = 2  # bump whenever SCHEMA changes
+REVIEW_PRIORITY = "CASE sample_source WHEN 'low_confidence' THEN 0 WHEN 'random' THEN 1 ELSE 2 END"
 RUN_LISTING = """
 SELECT runs.*, agent_configs.name AS config_name, run_summaries.summary AS summary,
   (SELECT COUNT(*) FROM trials t WHERE t.run_id = runs.run_id) AS total_trials,
@@ -53,7 +55,8 @@ CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, suite_id TEXT, suite_version INTEGER,
   config_hash TEXT REFERENCES agent_configs, trials_per_task INTEGER, mode TEXT, status TEXT,
   budget_usd REAL, seed INTEGER, concurrency INTEGER, flags TEXT NOT NULL DEFAULT '[]',
-  labels TEXT NOT NULL DEFAULT '{}', harness_version TEXT, created_at TEXT, finished_at TEXT
+  labels TEXT NOT NULL DEFAULT '{}', harness_version TEXT, judge_model TEXT,
+  created_at TEXT, finished_at TEXT
 );
 CREATE TABLE IF NOT EXISTS trials (
   trial_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs,
@@ -64,12 +67,14 @@ CREATE TABLE IF NOT EXISTS trials (
   output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, cost_usd REAL,
   duration_s REAL, worker_id TEXT, reserved_usd REAL NOT NULL DEFAULT 0,
   not_before REAL NOT NULL DEFAULT 0, trajectory_uri TEXT, final_state_uri TEXT,
+  judge_cost_usd REAL NOT NULL DEFAULT 0,
+  original_outcome TEXT,  -- set when a reviewer overrides the outcome (FR-REV-06)
   UNIQUE (run_id, task_id, trial_index)
 );
 CREATE TABLE IF NOT EXISTS trial_attempts (
   trial_id TEXT NOT NULL REFERENCES trials, attempt INTEGER NOT NULL, worker_id TEXT,
   outcome TEXT, error_code TEXT, error TEXT, cost_usd REAL NOT NULL DEFAULT 0,
-  trajectory_uri TEXT, started_at TEXT, ended_at TEXT,
+  judge_cost_usd REAL NOT NULL DEFAULT 0, trajectory_uri TEXT, started_at TEXT, ended_at TEXT,
   PRIMARY KEY (trial_id, attempt)
 );
 CREATE TABLE IF NOT EXISTS grades (
@@ -80,8 +85,27 @@ CREATE TABLE IF NOT EXISTS grades (
 CREATE TABLE IF NOT EXISTS run_summaries (
   run_id TEXT PRIMARY KEY REFERENCES runs, summary TEXT NOT NULL, computed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS reviews (
+  review_id TEXT PRIMARY KEY, trial_id TEXT NOT NULL REFERENCES trials,
+  attempt INTEGER NOT NULL,
+  grader_name TEXT NOT NULL DEFAULT '',  -- judge grader under review; '' for a trial audit
+  sample_source TEXT NOT NULL,  -- random | low_confidence | manual
+  queued_at TEXT, reviewer TEXT, passed INTEGER, score REAL, note TEXT,
+  override INTEGER NOT NULL DEFAULT 0, reviewed_at TEXT,
+  UNIQUE (trial_id, attempt, grader_name, sample_source)
+);
+CREATE TABLE IF NOT EXISTS failure_tags (
+  trial_id TEXT NOT NULL REFERENCES trials, tag TEXT NOT NULL,
+  source TEXT NOT NULL,  -- human | auto
+  note TEXT, PRIMARY KEY (trial_id, tag)
+);
 CREATE INDEX IF NOT EXISTS idx_trials_run_state ON trials (run_id, state);
+CREATE INDEX IF NOT EXISTS idx_reviews_pending ON reviews (reviewed_at, sample_source);
 """
+
+
+class StoreError(Exception):
+    """The database cannot be used as is."""
 
 
 @dataclass(frozen=True)
@@ -132,6 +156,7 @@ class RunSettings:
     concurrency: int
     harness_version: str
     labels: dict[str, str] = field(default_factory=dict)
+    judge_model: str | None = None
 
 
 class Store:
@@ -141,7 +166,18 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        fresh = not self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+        ).fetchone()
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if not fresh and version != SCHEMA_VERSION:
+            self._conn.close()
+            raise StoreError(
+                f"{path} uses schema version {version}, but this release needs {SCHEMA_VERSION}; "
+                "move it aside to start a fresh database"
+            )
         self._conn.executescript(SCHEMA)
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
         self._conn.close()
@@ -241,8 +277,9 @@ class Store:
             )
             conn.execute(
                 "INSERT INTO runs (run_id, suite_id, suite_version, config_hash, trials_per_task, "
-                "mode, status, budget_usd, seed, concurrency, labels, harness_version, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 'live', 'pending', ?, ?, ?, ?, ?, ?)",
+                "mode, status, budget_usd, seed, concurrency, labels, harness_version, "
+                "judge_model, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'live', 'pending', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     settings.suite_id,
@@ -254,6 +291,7 @@ class Store:
                     settings.concurrency,
                     json.dumps(settings.labels),
                     settings.harness_version,
+                    settings.judge_model,
                     _now(),
                 ),
             )
@@ -363,12 +401,14 @@ class Store:
         with self._transaction() as conn:
             conn.execute(
                 "UPDATE trial_attempts SET outcome = ?, error_code = ?, error = ?, cost_usd = ?, "
-                "trajectory_uri = ?, ended_at = ? WHERE trial_id = ? AND attempt = ?",
+                "judge_cost_usd = ?, trajectory_uri = ?, ended_at = ? "
+                "WHERE trial_id = ? AND attempt = ?",
                 (
                     result.outcome,
                     result.error_code,
                     result.error,
                     result.usage.cost_usd,
+                    result.judge_cost_usd,
                     str(result.trajectory_path),
                     _now(),
                     trial.trial_id,
@@ -394,7 +434,8 @@ class Store:
                 "UPDATE trials SET state = ?, outcome = ?, score = ?, termination = ?, "
                 "error_code = ?, error = ?, steps = ?, input_tokens = ?, output_tokens = ?, "
                 "cache_read_tokens = ?, cache_write_tokens = ?, cost_usd = ?, duration_s = ?, "
-                f"reserved_usd = 0, trajectory_uri = ?, final_state_uri = ? {owned}",
+                "judge_cost_usd = ?, reserved_usd = 0, trajectory_uri = ?, final_state_uri = ? "
+                f"{owned}",
                 (
                     _final_state(result),
                     result.outcome,
@@ -404,6 +445,7 @@ class Store:
                     result.error,
                     *_usage_columns(result),
                     result.duration_s,
+                    result.judge_cost_usd,
                     str(result.trajectory_path),
                     str(result.final_state_path) if result.final_state_path else None,
                     *holder,
@@ -414,12 +456,13 @@ class Store:
                 return False
             conn.executemany(
                 "INSERT INTO grades (trial_id, attempt, grader_name, kind, score, passed, "
-                "rationale, metadata) VALUES (?, ?, ?, 'deterministic', ?, ?, ?, ?)",
+                "rationale, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         trial.trial_id,
                         trial.attempt,
                         grade.name,
+                        grade.kind,
                         grade.score,
                         grade.passed,
                         grade.rationale,
@@ -478,7 +521,135 @@ class Store:
                 (trial_id,),
             )
         ]
+        trial["failure_tags"] = [
+            dict(tag)
+            for tag in self._conn.execute(
+                "SELECT tag, source, note FROM failure_tags WHERE trial_id = ? ORDER BY tag",
+                (trial_id,),
+            )
+        ]
         return trial
+
+    def task_spec(self, task_id: str, version: int) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT spec FROM task_versions WHERE task_id = ? AND version = ?", (task_id, version)
+        ).fetchone()
+        return json.loads(row["spec"]) if row else {}
+
+    def add_failure_tag(
+        self, trial_id: str, tag: str, source: str, note: str | None = None
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO failure_tags (trial_id, tag, source, note) VALUES (?, ?, ?, ?)",
+            (trial_id, tag, source, note),
+        )
+
+    # Human review (WF-09) ------------------------------------------------------------------
+
+    def queue_review(
+        self, trial_id: str, attempt: int, grader_name: str, source: str
+    ) -> str | None:
+        """Queue a review item; returns its id, or None if that item is already queued."""
+        review_id = str(uuid.uuid4())
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO reviews (review_id, trial_id, attempt, grader_name, "
+            "sample_source, queued_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (review_id, trial_id, attempt, grader_name, source, _now()),
+        )
+        return review_id if cursor.rowcount == 1 else None
+
+    def review_queue(self, limit: int) -> list[dict[str, Any]]:
+        """Pending items: low-confidence judge verdicts first, then random samples (FR-REV-01)."""
+        rows = self._conn.execute(
+            "SELECT r.*, t.run_id, t.task_id, t.task_version FROM reviews r "
+            "JOIN trials t USING (trial_id) WHERE r.reviewed_at IS NULL "
+            f"ORDER BY {REVIEW_PRIORITY}, r.queued_at, r.rowid LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def pending_reviews(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM reviews WHERE reviewed_at IS NULL"
+        ).fetchone()[0]
+
+    def get_review(self, review_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT r.*, t.run_id, t.task_id, t.task_version FROM reviews r "
+            "JOIN trials t USING (trial_id) WHERE r.review_id = ?",
+            (review_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def submit_review(
+        self,
+        review_id: str,
+        *,
+        reviewer: str,
+        passed: bool,
+        score: float | None,
+        note: str | None,
+        override: bool,
+    ) -> bool:
+        """Record a review once. An override replaces the trial's outcome with the reviewer's,
+        keeps the original, and drops the run's stored summary so it is recomputed (FR-REV-06)."""
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE reviews SET reviewer = ?, passed = ?, score = ?, note = ?, override = ?, "
+                "reviewed_at = ? WHERE review_id = ? AND reviewed_at IS NULL",
+                (reviewer, passed, score, note, override, _now(), review_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            if override:
+                trial_id, run_id = conn.execute(
+                    "SELECT t.trial_id, t.run_id FROM reviews r JOIN trials t USING (trial_id) "
+                    "WHERE r.review_id = ?",
+                    (review_id,),
+                ).fetchone()
+                conn.execute(
+                    "UPDATE trials SET original_outcome = COALESCE(original_outcome, outcome), "
+                    "outcome = ? WHERE trial_id = ? AND outcome IN ('pass', 'fail')",
+                    ("pass" if passed else "fail", trial_id),
+                )
+                conn.execute("DELETE FROM run_summaries WHERE run_id = ?", (run_id,))
+            return True
+
+    def grade_for(self, trial_id: str, attempt: int, grader_name: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT grader_name, kind, score, passed, rationale, metadata FROM grades "
+            "WHERE trial_id = ? AND attempt = ? AND grader_name = ?",
+            (trial_id, attempt, grader_name),
+        ).fetchone()
+        if row is None:
+            return None
+        return {**dict(row), "passed": bool(row["passed"]), "metadata": json.loads(row["metadata"])}
+
+    def calibration_rows(self) -> list[dict[str, Any]]:
+        """Every finished review of a judge grader, paired with the judge's own verdict."""
+        rows = self._conn.execute(
+            "SELECT r.review_id, r.trial_id, r.grader_name, r.sample_source, "
+            "r.passed AS human_passed, "
+            "g.passed AS judge_passed, g.metadata, t.task_id FROM reviews r "
+            "JOIN grades g ON g.trial_id = r.trial_id AND g.attempt = r.attempt "
+            "AND g.grader_name = r.grader_name "
+            "JOIN trials t ON t.trial_id = r.trial_id "
+            "WHERE r.reviewed_at IS NOT NULL AND r.grader_name != '' AND g.kind = 'judge' "
+            "ORDER BY r.reviewed_at",
+        )
+        return [
+            {
+                "review_id": row["review_id"],
+                "trial_id": row["trial_id"],
+                "task_id": row["task_id"],
+                "grader_name": row["grader_name"],
+                "judge_model": json.loads(row["metadata"]).get("judge_model"),
+                "sample_source": row["sample_source"],
+                "human_passed": bool(row["human_passed"]),
+                "judge_passed": bool(row["judge_passed"]),
+            }
+            for row in rows
+        ]
 
     def task_specs_for_run(self, run_id: str) -> dict[str, dict[str, Any]]:
         """The pinned task spec of every task in a run, by task id."""
@@ -505,6 +676,14 @@ class Store:
         """Agent spend across every attempt, including ones that ended in infra errors."""
         return self._conn.execute(
             "SELECT COALESCE(SUM(a.cost_usd), 0) FROM trial_attempts a "
+            "JOIN trials t USING (trial_id) WHERE t.run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+
+    def run_judge_spent(self, run_id: str) -> float:
+        """Judge spend, kept apart from agent spend and the run budget (NFR-COST-02)."""
+        return self._conn.execute(
+            "SELECT COALESCE(SUM(a.judge_cost_usd), 0) FROM trial_attempts a "
             "JOIN trials t USING (trial_id) WHERE t.run_id = ?",
             (run_id,),
         ).fetchone()[0]

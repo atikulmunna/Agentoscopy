@@ -33,6 +33,7 @@ class FakeSandbox:
         on_destroy: Callable[[], None] | None = None,
     ) -> None:
         self.files = dict(files or {})
+        self._initial = dict(self.files)
         self.commands: list[str] = []
         self.stopped = False
         self.destroyed = False
@@ -57,15 +58,31 @@ class FakeSandbox:
         return ExecResult(0, b"", b"")
 
     async def read_file(self, path: str) -> bytes:
-        if path not in self.files:
-            raise SandboxError(f"cannot read {path}: no such file")
-        return self.files[path]
+        prefix = self._workdir + "/"
+        relative = path[len(prefix) :] if path.startswith(prefix) else path
+        for name in (path, relative):
+            if name in self.files:
+                return self.files[name]
+        raise SandboxError(f"cannot read {path}: no such file")
 
     async def write_file(self, path: str, data: bytes) -> None:
         self.files[path] = data
 
     async def diff(self) -> str:
-        return "\n".join(f"C {path}" for path in sorted(self.files))
+        """Like `docker diff`: absolute paths of files added, changed, or deleted since the
+        sandbox was created. Relative paths resolve against the workdir."""
+        lines = []
+        for name in sorted(set(self.files) | set(self._initial)):
+            if name not in self._initial:
+                lines.append(f"A {self._absolute(name)}")
+            elif name not in self.files:
+                lines.append(f"D {self._absolute(name)}")
+            elif self.files[name] != self._initial[name]:
+                lines.append(f"C {self._absolute(name)}")
+        return "\n".join(lines)
+
+    def _absolute(self, path: str) -> str:
+        return path if path.startswith("/") else f"{self._workdir}/{path}"
 
     async def stop(self) -> None:
         self.stopped = True

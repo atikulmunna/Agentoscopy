@@ -1,9 +1,10 @@
 import asyncio
 
 import pytest
-from conftest import running_gateway
+from conftest import BASE_TASK, SetupBackend, running_gateway
 
 from agentoscopy.adapters.base import AgentResult
+from agentoscopy.graders.pipeline import CACHE_CLEANUP
 from agentoscopy.recorder.trajectory import read_events
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.spec import AgentConfig
@@ -82,7 +83,8 @@ def test_passing_attempt_records_everything_and_cleans_up(make_task, tmp_path):
     (agent_box,) = backend.agent_sandboxes
     (grading_box,) = backend.grading_sandboxes
     assert agent_box.stopped and agent_box.destroyed and grading_box.destroyed
-    assert grading_box.commands == ["run-tests"]  # graders never run in the agent's sandbox
+    # Graders never run in the agent's sandbox; caches are cleared before they run.
+    assert grading_box.commands == [CACHE_CLEANUP.format(workdir="/workspace"), "run-tests"]
     assert event_types(result) == [
         "trial_start",
         "model_request",
@@ -96,7 +98,7 @@ def test_passing_attempt_records_everything_and_cleans_up(make_task, tmp_path):
     ]
     tool_call = read_events(result.trajectory_path)[5]
     assert tool_call["step"] == 2  # tool events belong to the model call before them
-    assert result.final_state_path.read_text() == "C app.py"
+    assert result.final_state_path.read_text() == "A /workspace/app.py"
     assert "attempt-1.jsonl" in str(result.trajectory_path)
 
 
@@ -124,7 +126,7 @@ def test_timeout_is_an_agent_outcome_and_still_graded(make_task, tmp_path):
     result = attempt(tmp_path, make_task(budget={"timeout_s": 1}), backend, adapter=SleepingAgent())
 
     assert (result.outcome, result.termination) == ("pass", "timeout")
-    assert backend.grading_sandboxes[0].commands == ["run-tests"]
+    assert backend.grading_sandboxes[0].commands[-1] == "run-tests"
 
 
 def test_agent_crash_is_graded_and_recorded(make_task, tmp_path):
@@ -228,3 +230,54 @@ def test_deadline_still_cancels_a_stuck_agent():
 
     with pytest.raises(TimeoutError):
         asyncio.run(_with_deadline(stuck(), 0.05, lambda: 0.0))
+
+
+JUDGE = {"name": "quality", "type": "llm_judge", "rubric": "Pass if minimal.", "required": False}
+TAMPER = {"name": "no_tamper", "type": "tamper_check", "weight": 0}
+
+
+def with_graders(make_task, *extra, **overrides):
+    return make_task(graders=[*BASE_TASK["graders"], *extra], **overrides)
+
+
+def test_judge_spend_is_tracked_apart_from_agent_spend(make_task, tmp_path):
+    task = with_graders(make_task, JUDGE)
+
+    result = attempt(tmp_path, task, FakeBackend(grader=passes_when_fixed), judge_model="mock")
+
+    judge = next(grade for grade in result.grades if grade.kind == "judge")
+    assert result.outcome == "pass" and judge.metadata["judge_model"] == "mock"
+    assert result.usage.cost_usd == 0 and result.judge_cost_usd > 0
+    (grading_log,) = (tmp_path / "home").rglob("grading.jsonl")
+    assert "model_request" in [event["type"] for event in read_events(grading_log)]
+    end = read_events(result.trajectory_path)[-1]["payload"]
+    assert end["totals"]["judge_cost_usd"] == pytest.approx(result.judge_cost_usd)
+
+
+def test_a_judge_without_a_judge_model_is_never_the_agents_failure(make_task, tmp_path):
+    task = with_graders(make_task, JUDGE)
+
+    result = attempt(tmp_path, task, FakeBackend(grader=passes_when_fixed))
+
+    assert (result.outcome, result.error_code) == ("infra_error", "GRADER_UNSTABLE")
+
+
+def test_tampering_vetoes_an_attempt_whose_tests_pass(make_task, tmp_path):
+    task = with_graders(make_task, {**TAMPER, "protected_paths": ["/workspace/tests/**"]})
+    script = [FIX, {"write": "tests/test_app.py", "content": "assert True"}]
+
+    result = attempt(tmp_path, task, FakeBackend(grader=passes_when_fixed), script)
+
+    assert result.grades[0].passed  # the tests pass
+    assert (result.outcome, result.score, result.vetoed) == ("fail", 0.0, True)
+    assert read_events(result.trajectory_path)[-1]["payload"]["vetoed"] is True
+
+
+def test_changes_made_by_setup_are_not_blamed_on_the_agent(make_task, tmp_path):
+    environment = {**BASE_TASK["environment"], "setup": ["install-deps"]}
+    task = with_graders(make_task, TAMPER, environment=environment)
+
+    result = attempt(tmp_path, task, SetupBackend(grader=passes_when_fixed))
+
+    assert (result.outcome, result.vetoed) == ("pass", False)
+    assert result.final_state_path.read_text() == "A /workspace/app.py"

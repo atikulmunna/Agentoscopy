@@ -1,4 +1,5 @@
 import pytest
+from conftest import BASE_TASK
 
 from agentoscopy.cli.common import EXIT_INVALID_INPUT, EXIT_OK
 from agentoscopy.cli.main import main
@@ -91,3 +92,58 @@ def test_report_prints_a_stored_run(tasks_dir, tmp_path, capsys):
     assert agentoscopy(tmp_path, tasks_dir, "report", run_id, "--format", "md") == EXIT_OK
     assert f"# Run {run_id}" in capsys.readouterr().out
     assert agentoscopy(tmp_path, tasks_dir, "report", "missing-run") == EXIT_INVALID_INPUT
+
+
+JUDGED = {"name": "quality", "type": "llm_judge", "rubric": "Minimal?", "required": False}
+
+
+def judged_task(write_task, tasks_dir, tmp_path):
+    write_task({**BASE_TASK, "graders": [*BASE_TASK["graders"], JUDGED]})
+    store = Store(tmp_path / "home" / "agentoscopy.db")
+    store.save_task_version(load_task(tasks_dir, "demo-task"), "img", [], [])
+    store.close()
+
+
+def test_a_real_judge_without_credentials_is_refused_before_the_run(
+    write_task, tasks_dir, tmp_path, capsys
+):
+    judged_task(write_task, tasks_dir, tmp_path)
+
+    exit_code = agentoscopy(
+        tmp_path, tasks_dir, "run", "--task", "demo-task", "--agent", "agent.yaml"
+    )
+
+    assert exit_code == EXIT_INVALID_INPUT
+    assert "JUDGE_NEEDS_CREDENTIALS" in capsys.readouterr().err
+    store = Store(tmp_path / "home" / "agentoscopy.db")
+    assert store.list_runs() == []
+    store.close()
+
+
+def test_validate_refuses_a_real_judge_without_credentials(write_task, tasks_dir, tmp_path, capsys):
+    write_task({**BASE_TASK, "graders": [*BASE_TASK["graders"], JUDGED]})
+
+    exit_code = agentoscopy(tmp_path, tasks_dir, "task", "validate", "demo-task")
+
+    assert exit_code == EXIT_INVALID_INPUT
+    assert "FAIL  demo-task: JUDGE_NEEDS_CREDENTIALS" in capsys.readouterr().out
+
+
+def test_an_unpriced_judge_model_is_refused(write_task, tasks_dir, tmp_path, capsys):
+    judged_task(write_task, tasks_dir, tmp_path)
+
+    exit_code = agentoscopy(
+        tmp_path, tasks_dir, "run", "--task", "demo-task", "--agent", "agent.yaml",
+        "--judge-model", "gpt-x",
+    )  # fmt: skip
+
+    assert exit_code == EXIT_INVALID_INPUT
+    assert "UNKNOWN_JUDGE_MODEL" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("rate", ["-0.1", "1.5", "lots"])
+def test_review_rate_must_be_a_fraction(tasks_dir, tmp_path, rate):
+    with pytest.raises(SystemExit):
+        agentoscopy(
+            tmp_path, tasks_dir, "run", "--task", "t", "--agent", "a.yaml", "--review-rate", rate
+        )

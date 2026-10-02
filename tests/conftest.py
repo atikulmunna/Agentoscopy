@@ -11,6 +11,7 @@ from agentoscopy.gateway.mock import mock_message, sse_events
 from agentoscopy.gateway.server import Gateway
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
 from agentoscopy.spec import Task, load_task
+from agentoscopy.testing.fake_sandbox import FakeBackend
 
 FAKE_DIGEST = "sha256:" + "0" * 64
 
@@ -133,3 +134,19 @@ async def running_provider() -> AsyncIterator[FakeProvider]:
         yield provider
     finally:
         await provider.stop()
+
+
+class SetupBackend(FakeBackend):
+    """Its setup command installs a package outside the workdir, as `pip install` would."""
+
+    async def create(self, image, task, trial_id):
+        sandbox = await super().create(image, task, trial_id)
+        run = sandbox.exec
+
+        async def exec(cmd, timeout_s=60):
+            if cmd == "install-deps":
+                sandbox.files["/usr/lib/python3/site-packages/dep.py"] = b"dep"
+            return await run(cmd, timeout_s)
+
+        sandbox.exec = exec
+        return sandbox

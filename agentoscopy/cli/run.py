@@ -27,6 +27,7 @@ from agentoscopy.scheduler.plan import (
     PinnedTask,
     PlanError,
     check_budget,
+    check_judge,
     estimate_cost,
     pin_tasks,
     plan_trials,
@@ -42,6 +43,7 @@ class _Prepared:
     pinned: list[PinnedTask]
     config: AgentConfig
     settings: RunSettings
+    review_rate: float
 
 
 def run_command(args: argparse.Namespace) -> int:
@@ -63,7 +65,7 @@ def run_command(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
     try:
-        prepared = _prepare(args, store)
+        prepared = _prepare(args, store, has_credentials=proxy is not None)
     except (SpecError, PlanError, AdapterLoadError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INVALID_INPUT
@@ -96,10 +98,11 @@ def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) 
     return EXIT_OK
 
 
-def _prepare(args: argparse.Namespace, store: Store) -> _Prepared:
+def _prepare(args: argparse.Namespace, store: Store, *, has_credentials: bool) -> _Prepared:
     task_ids = load_suite(args.suites_dir, args.suite).tasks if args.suite else args.tasks
     pinned = pin_tasks(store, args.tasks_dir, task_ids)
     check_budget(pinned, args.budget_usd)
+    judge_model = check_judge([item.task for item in pinned], args.judge_model, has_credentials)
     config = load_agent_config(args.agent)
     load_python_adapter(config.entrypoint)  # fail before the run exists if it cannot load
     suite_version = None
@@ -115,8 +118,9 @@ def _prepare(args: argparse.Namespace, store: Store) -> _Prepared:
         concurrency=args.concurrency,
         harness_version=version("agentoscopy"),
         labels=_labels(args.label),
+        judge_model=judge_model,
     )
-    return _Prepared(pinned, config, settings)
+    return _Prepared(pinned, config, settings, args.review_rate)
 
 
 async def _execute(
@@ -136,6 +140,8 @@ async def _execute(
             concurrency=prepared.settings.concurrency,
             seed=prepared.settings.seed,
             on_progress=_ProgressPrinter(),
+            judge_model=prepared.settings.judge_model,
+            review_rate=prepared.review_rate,
         )
         await executor.execute()
     finally:

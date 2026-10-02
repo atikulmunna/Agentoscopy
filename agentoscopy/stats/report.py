@@ -32,6 +32,13 @@ def _headline(summary: dict[str, Any], run: dict[str, Any]) -> list[str]:
         f"cost ${summary['total_cost_usd']:.4f}"
         + (f", ${cost_per_pass:.4f} per pass" if cost_per_pass is not None else ""),
     ]
+    if summary.get("judge_cost_usd"):
+        lines.append(f"judging ${summary['judge_cost_usd']:.4f} (on top of agent cost)")
+    if summary.get("uncalibrated_judges"):
+        judges = ", ".join(summary["uncalibrated_judges"])
+        lines.append(
+            f"warning: uncalibrated judges, so pass rates that use them may be off: {judges}"
+        )
     if summary["flaky_tasks"]:
         lines.append(f"flaky: {', '.join(summary['flaky_tasks'])}")
     if summary["unscored_tasks"]:

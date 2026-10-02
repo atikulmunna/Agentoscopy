@@ -126,3 +126,18 @@ def test_summary_slices_by_task_metadata():
         "fast": 1.0,
         "py": 0.5,
     }
+
+
+@pytest.mark.parametrize("output_format", ["table", "md"])
+def test_reports_show_judge_spend_and_uncalibrated_judges(output_format):
+    summary = summarize(rows("task-a", "pass"), trials_per_task=1, seed=1, spent_usd=0.1)
+    summary |= {"judge_cost_usd": 0.0123, "uncalibrated_judges": ["task-a/quality"]}
+    run = {
+        "run_id": "r1", "suite_id": None, "config_name": "agent", "trials_per_task": 1,
+        "seed": 1, "status": "completed", "flags": [],
+    }  # fmt: skip
+
+    text = render(summary, run, output_format)
+
+    assert "judging $0.0123" in text
+    assert "uncalibrated judges" in text and "task-a/quality" in text

@@ -7,7 +7,6 @@ plan); 3 environment or harness failure.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import secrets
 import sys
 from pathlib import Path
@@ -17,19 +16,19 @@ from aiohttp import web
 from agentoscopy.api.server import create_app
 from agentoscopy.cli.common import (
     DB_NAME,
-    EXIT_CHECK_FAILED,
-    EXIT_ENVIRONMENT,
+    DEFAULT_JUDGE_MODEL,
     EXIT_INVALID_INPUT,
     EXIT_OK,
+    all_task_ids,
 )
 from agentoscopy.cli.run import run_command
+from agentoscopy.cli.validate import validate_command
 from agentoscopy.reporting import NotFound, comparison, run_summary
-from agentoscopy.sandbox.docker import DockerBackend
+from agentoscopy.scheduler.runner import REVIEW_RATE
 from agentoscopy.spec import SpecError, load_task
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.stats.report import FORMATS, render, render_comparison
 from agentoscopy.storage.store import Store
-from agentoscopy.validation import CHECK_FAILURE_CODES, validate_task
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,7 +59,10 @@ def _parser() -> argparse.ArgumentParser:
     validate = task_commands.add_parser("validate", parents=[common], help="run WF-01 checks")
     validate.add_argument("task_ids", nargs="*", metavar="TASK_ID")
     validate.add_argument("--all", action="store_true", help="validate every task")
-    validate.set_defaults(handler=_validate_command)
+    validate.add_argument(
+        "--judge-model", default=DEFAULT_JUDGE_MODEL, help="pinned model for llm_judge graders"
+    )
+    validate.set_defaults(handler=validate_command)
     listing = task_commands.add_parser("list", parents=[common], help="tasks and validation status")
     listing.set_defaults(handler=_list_command)
 
@@ -80,6 +82,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--concurrency", type=_positive_int, default=4)
     run.add_argument("--seed", type=int, help="dispatch order and mock responses (default random)")
     run.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
+    run.add_argument(
+        "--judge-model", default=DEFAULT_JUDGE_MODEL, help="pinned model for llm_judge graders"
+    )
+    run.add_argument(
+        "--review-rate",
+        type=_fraction,
+        default=REVIEW_RATE,
+        help="fraction of trials sampled for human review",
+    )
     run.set_defaults(handler=run_command)
 
     report = commands.add_parser("report", parents=[common], help="print a run summary")
@@ -105,45 +116,10 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_command(args: argparse.Namespace) -> int:
-    task_ids = _all_task_ids(args.tasks_dir) if args.all else args.task_ids
-    if not task_ids:
-        print("error: name one or more task ids, or pass --all", file=sys.stderr)
-        return EXIT_INVALID_INPUT
-    store = Store(args.home / DB_NAME)
-    worst = EXIT_OK
-    try:
-        for task_id in task_ids:
-            worst = max(worst, _validate_one(store, args.tasks_dir, task_id))
-    finally:
-        store.close()
-    return worst
-
-
-def _validate_one(store: Store, tasks_dir: Path, task_id: str) -> int:
-    try:
-        task = load_task(tasks_dir, task_id)
-    except SpecError as exc:
-        print(f"FAIL  {task_id}: SCHEMA_INVALID {exc}")
-        return EXIT_INVALID_INPUT
-    report = asyncio.run(validate_task(task, DockerBackend()))
-    for problem in report.cleanup_errors:
-        print(f"warning: {problem}", file=sys.stderr)
-    if not report.ok:
-        print(f"FAIL  {task_id}: {report.error_code} {report.message}")
-        return EXIT_CHECK_FAILED if report.error_code in CHECK_FAILURE_CODES else EXIT_ENVIRONMENT
-    version = store.save_task_version(
-        task, report.image_digest, report.flags, report.verified_graders
-    )
-    notes = f" ({', '.join(report.flags)})" if report.flags else ""
-    print(f"ok    {task_id}: version {version}, verified graders {report.verified_graders}{notes}")
-    return EXIT_OK
-
-
 def _list_command(args: argparse.Namespace) -> int:
     store = Store(args.home / DB_NAME)
     try:
-        for task_id in _all_task_ids(args.tasks_dir):
+        for task_id in all_task_ids(args.tasks_dir):
             print(_task_status(store, args.tasks_dir, task_id))
     finally:
         store.close()
@@ -202,14 +178,15 @@ def _serve_command(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _all_task_ids(tasks_dir: Path) -> list[str]:
-    if not tasks_dir.is_dir():
-        return []
-    return sorted(path.name for path in tasks_dir.iterdir() if (path / "task.yaml").is_file())
-
-
 def _positive_int(text: str) -> int:
     value = int(text)
     if value <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _fraction(text: str) -> float:
+    value = float(text)
+    if not 0 <= value <= 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
     return value

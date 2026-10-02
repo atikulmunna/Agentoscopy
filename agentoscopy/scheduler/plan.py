@@ -6,6 +6,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentoscopy.gateway.pricing import is_mock, price_for
 from agentoscopy.spec import Task, load_task
 from agentoscopy.storage.store import NewTrial, Store
 
@@ -53,6 +54,23 @@ def check_budget(pinned: list[PinnedTask], budget_usd: float | None) -> None:
             f"BUDGET_BELOW_TRIAL_CAP: run budget ${budget_usd:.2f} is below a trial's "
             f"max_cost_usd of ${largest:.2f}, so that trial could never be dispatched"
         )
+
+
+def check_judge(tasks: list[Task], judge_model: str, has_credentials: bool) -> str | None:
+    """The judge model to pin, or None when no task has llm_judge graders. A real judge model
+    needs provider credentials, which only the credential proxy holds."""
+    if not any(task.spec.has_judges() for task in tasks):
+        return None
+    if price_for(judge_model) is None:
+        raise PlanError(
+            f"UNKNOWN_JUDGE_MODEL: no price for {judge_model!r}, so judge spend cannot be tracked"
+        )
+    if not is_mock(judge_model) and not has_credentials:
+        raise PlanError(
+            f"JUDGE_NEEDS_CREDENTIALS: judge model {judge_model!r} needs ANTHROPIC_API_KEY "
+            "(or pass a mock judge model)"
+        )
+    return judge_model
 
 
 def plan_trials(pinned: list[PinnedTask], trials_per_task: int, seed: int) -> list[NewTrial]:

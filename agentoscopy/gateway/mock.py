@@ -1,5 +1,7 @@
 """Mock provider (FR-TST-01): seeded-random Messages API responses with real-looking usage.
 
+Structured-output requests get seeded JSON that fits the requested schema.
+
 The same seed key always produces the same response, so runs against the mock are repeatable.
 """
 
@@ -22,9 +24,15 @@ def estimate_input_tokens(body: dict[str, Any]) -> int:
 
 def mock_message(body: dict[str, Any], seed_key: str) -> dict[str, Any]:
     rng = random.Random(seed_key)
-    wanted = rng.randint(*OUTPUT_TOKENS_RANGE)
-    output_tokens = min(wanted, int(body["max_tokens"]))
-    text = " ".join(rng.choice(WORDS) for _ in range(output_tokens))
+    schema = ((body.get("output_config") or {}).get("format") or {}).get("schema")
+    if schema:  # structured output: seeded JSON that fits the schema, as a judge expects
+        text = json.dumps(_instance(schema, rng, schema.get("$defs", {})))
+        wanted = len(text) // 4 + 1
+        output_tokens = min(wanted, int(body["max_tokens"]))
+    else:
+        wanted = rng.randint(*OUTPUT_TOKENS_RANGE)
+        output_tokens = min(wanted, int(body["max_tokens"]))
+        text = " ".join(rng.choice(WORDS) for _ in range(output_tokens))
     return {
         "id": f"msg_mock_{rng.getrandbits(64):016x}",
         "type": "message",
@@ -40,6 +48,29 @@ def mock_message(body: dict[str, Any], seed_key: str) -> dict[str, Any]:
             "cache_read_input_tokens": 0,
         },
     }
+
+
+def _instance(schema: dict[str, Any], rng: random.Random, defs: dict[str, Any]) -> Any:
+    """A seeded value for a JSON schema: objects, arrays, enums, and scalar types."""
+    if "$ref" in schema:
+        return _instance(defs[schema["$ref"].rsplit("/", 1)[-1]], rng, defs)
+    if "enum" in schema:
+        return rng.choice(schema["enum"])
+    kind = schema.get("type")
+    if kind == "object":
+        properties = schema.get("properties", {})
+        return {name: _instance(prop, rng, defs) for name, prop in properties.items()}
+    if kind == "array":
+        return []
+    if kind == "boolean":
+        return rng.random() < 0.5
+    if kind == "integer":
+        return rng.randint(0, 10)
+    if kind == "number":
+        return round(rng.random(), 3)
+    if kind == "string":
+        return f"mock {rng.choice(WORDS)}"
+    return None
 
 
 def sse_events(message: dict[str, Any]) -> list[bytes]:

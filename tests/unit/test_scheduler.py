@@ -4,8 +4,14 @@ import pytest
 from conftest import BASE_TASK, running_gateway
 
 from agentoscopy.sandbox.base import ExecResult
-from agentoscopy.scheduler.plan import PlanError, check_budget, pin_tasks, plan_trials
-from agentoscopy.scheduler.runner import RunExecutor
+from agentoscopy.scheduler.plan import (
+    PlanError,
+    check_budget,
+    check_judge,
+    pin_tasks,
+    plan_trials,
+)
+from agentoscopy.scheduler.runner import LOW_CONFIDENCE, RunExecutor
 from agentoscopy.spec import AgentConfig, load_task
 from agentoscopy.storage.store import RunSettings, Store
 from agentoscopy.testing.fake_sandbox import FakeBackend, exit_with
@@ -47,7 +53,9 @@ def config(script):
     )
 
 
-def execute(store, tmp_path, pinned, backend, script, trials=2, budget=None, concurrency=2):
+def execute(
+    store, tmp_path, pinned, backend, script, trials=2, budget=None, concurrency=2, **options
+):
     settings = RunSettings(
         suite_id=None,
         suite_version=None,
@@ -76,6 +84,7 @@ def execute(store, tmp_path, pinned, backend, script, trials=2, budget=None, con
                 adapter_factory=lambda _: ScriptedAgent(),
                 on_progress=progress.append,
                 retry_backoff_s=0.01,
+                **options,
             )
             await executor.execute()
 
@@ -175,3 +184,75 @@ def test_critical_tasks_get_enough_trials_to_reach_significance(validated):
     }
     assert per_task == {"normal-task": 2, "key-task": 6}
     assert len({trial.dispatch_order for trial in trials}) == len(trials)
+
+
+JUDGE = {"name": "quality", "type": "llm_judge", "rubric": "Pass if minimal.", "required": False}
+TAMPER = {"name": "no_tamper", "type": "tamper_check", "protected_paths": ["/workspace/tests/**"]}
+
+
+def test_review_rate_samples_finished_trials_as_audits(store, tmp_path, validated):
+    pinned = validated("task-a")
+    backend = FakeBackend(grader=passes_when_fixed)
+
+    execute(store, tmp_path, pinned, backend, [FIX], trials=3, review_rate=0.0)
+    assert store.pending_reviews() == 0
+
+    execute(store, tmp_path, pinned, backend, [FIX], trials=3, review_rate=1.0)
+    queue = store.review_queue(limit=10)
+    assert [(item["grader_name"], item["sample_source"]) for item in queue] == [("", "random")] * 3
+
+
+def test_judged_trials_are_sampled_per_judge_and_unsure_verdicts_are_queued(
+    store, tmp_path, validated
+):
+    pinned = validated("task-a", graders=[*BASE_TASK["graders"], JUDGE])
+    backend = FakeBackend(grader=passes_when_fixed)
+
+    run_id, _ = execute(
+        store, tmp_path, pinned, backend, [FIX], trials=8, judge_model="mock", review_rate=1.0
+    )
+
+    queue = store.review_queue(limit=100)
+    random_items = [item for item in queue if item["sample_source"] == "random"]
+    unsure = [item for item in queue if item["sample_source"] == "low_confidence"]
+    assert len(random_items) == 8 and {item["grader_name"] for item in random_items} == {"quality"}
+    expected = sum(
+        store.grade_for(row["trial_id"], 1, "quality")["metadata"]["confidence"] < LOW_CONFIDENCE
+        for row in store.trial_rows(run_id)
+    )
+    assert len(unsure) == expected > 0
+    assert store.run_judge_spent(run_id) > 0
+
+
+def test_vetoed_trials_are_tagged_as_reward_hacking(store, tmp_path, validated):
+    pinned = validated("task-a", graders=[*BASE_TASK["graders"], TAMPER])
+    script = [FIX, {"write": "tests/test_app.py", "content": "assert True"}]
+
+    run_id, _ = execute(store, tmp_path, pinned, FakeBackend(grader=passes_when_fixed), script)
+
+    for row in store.trial_rows(run_id):
+        assert row["outcome"] == "fail"
+        tags = store.get_trial(row["trial_id"])["failure_tags"]
+        assert tags == [
+            {"tag": "reward_hacking", "source": "auto", "note": "tamper_check vetoed the trial"}
+        ]
+
+
+def test_judge_model_is_only_pinned_for_tasks_with_judges(validated):
+    plain = [item.task for item in validated("task-a")]
+    judged = [item.task for item in validated("task-b", graders=[*BASE_TASK["graders"], JUDGE])]
+
+    assert check_judge(plain, "claude-opus-5-5", has_credentials=False) is None
+    assert check_judge(judged, "mock", has_credentials=False) == "mock"
+    assert check_judge(judged, "claude-opus-5-5", has_credentials=True) == "claude-opus-5-5"
+
+
+@pytest.mark.parametrize(
+    ("model", "credentials", "code"),
+    [("claude-opus-5-5", False, "JUDGE_NEEDS_CREDENTIALS"), ("gpt-x", True, "UNKNOWN_JUDGE_MODEL")],
+)
+def test_unusable_judge_models_are_rejected(validated, model, credentials, code):
+    judged = [item.task for item in validated("task-b", graders=[*BASE_TASK["graders"], JUDGE])]
+
+    with pytest.raises(PlanError, match=code):
+        check_judge(judged, model, has_credentials=credentials)

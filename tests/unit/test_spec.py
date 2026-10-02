@@ -183,3 +183,40 @@ def test_spelling_out_a_default_value_keeps_the_same_version(write_task, tasks_d
     write_task({**BASE_TASK, "critical": False, "category": "uncategorized", "tags": []})
 
     assert load_task(tasks_dir, "demo-task").content_hash == implicit
+
+
+def test_every_grader_type_loads_with_its_defaults(make_task):
+    graders = [
+        *BASE_TASK["graders"],
+        {"name": "safe", "type": "forbidden_command", "patterns": [r"git\s+push"]},
+        {"name": "careful", "type": "must_read_before_edit", "required": False},
+        {"name": "tidy", "type": "max_tool_errors", "max": 0},
+        {"name": "quick", "type": "max_steps", "max": 20},
+        {"name": "no_tamper", "type": "tamper_check"},
+        {"name": "quality", "type": "llm_judge", "rubric": "Minimal?", "required": False},
+    ]
+
+    spec = make_task(graders=graders).spec
+
+    by_name = {grader.name: grader for grader in spec.graders}
+    assert [grader.type for grader in spec.graders] == [grader["type"] for grader in graders]
+    assert (by_name["no_tamper"].allowed_paths, by_name["no_tamper"].protected_paths) == (None, [])
+    assert (by_name["quality"].max_cost_usd, by_name["quality"].timeout_s) == (0.25, 180)
+    assert spec.has_judges() and not make_task().spec.has_judges()
+
+
+@pytest.mark.parametrize(
+    ("grader", "expected"),
+    [
+        ({"name": "x", "type": "shell", "run": "x"}, "graders.0"),
+        ({"name": "x", "type": "max_tool_errors", "max": -1}, "graders.0.max_tool_errors.max"),
+        ({"name": "x", "type": "max_steps", "max": 0}, "graders.0.max_steps.max"),
+        ({"name": "x", "type": "llm_judge", "rubric": ""}, "graders.0.llm_judge.rubric"),
+        ({"name": "x", "type": "forbidden_command", "patterns": ["("]}, "patterns"),
+    ],
+)
+def test_invalid_graders_are_rejected(write_task, tasks_dir, grader, expected):
+    write_task({**BASE_TASK, "graders": [grader]})
+
+    with pytest.raises(SpecError, match=expected.replace(".", r"\.")):
+        load_task(tasks_dir, "demo-task")
