@@ -1,34 +1,46 @@
 """`agentoscopy` command-line interface.
 
 Exit codes: 0 success; 1 a task failed a validation check; 2 invalid input (spec, config, or
-plan); 3 environment or harness failure.
+plan); 3 environment or harness failure; 130 the run was cancelled. `agentoscopy ci` has
+its own codes (see agentoscopy.cli.ci).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import secrets
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 from aiohttp import web
 
+from agentoscopy.api.runs import RunService
 from agentoscopy.api.server import create_app
+from agentoscopy.cli.ci import ci_command
 from agentoscopy.cli.common import (
     DB_NAME,
-    DEFAULT_JUDGE_MODEL,
     EXIT_INVALID_INPUT,
     EXIT_OK,
     all_task_ids,
 )
-from agentoscopy.cli.run import run_command
+from agentoscopy.cli.manage import cancel_command, gc_command
+from agentoscopy.cli.run import run_command, start_proxy
 from agentoscopy.cli.validate import validate_command
+from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
 from agentoscopy.reporting import NotFound, comparison, run_summary
+from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.scheduler.runner import REVIEW_RATE
 from agentoscopy.spec import SpecError, load_task
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.stats.report import FORMATS, render, render_comparison
 from agentoscopy.storage.store import Store
+
+TOKEN_ENV = "AGENTOSCOPY_API_TOKEN"  # a fixed API token, e.g. for a Prometheus scraper
+DURATION_PATTERN = re.compile(r"^(\d+)([smhd])$")
+DURATION_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,6 +60,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--tasks-dir", type=Path, default=Path("tasks"))
     common.add_argument("--suites-dir", type=Path, default=Path("suites"))
+    run_options = _run_options()
 
     parser = argparse.ArgumentParser(
         prog="agentoscopy", description="Evaluation harness for LLM agents."
@@ -66,7 +79,9 @@ def _parser() -> argparse.ArgumentParser:
     listing = task_commands.add_parser("list", parents=[common], help="tasks and validation status")
     listing.set_defaults(handler=_list_command)
 
-    run = commands.add_parser("run", parents=[common], help="run a suite or tasks with an agent")
+    run = commands.add_parser(
+        "run", parents=[common, run_options], help="run a suite or tasks with an agent"
+    )
     selection = run.add_mutually_exclusive_group(required=True)
     selection.add_argument("--suite", help="suite name (suites/<name>.yaml)")
     selection.add_argument(
@@ -76,22 +91,59 @@ def _parser() -> argparse.ArgumentParser:
         metavar="TASK_ID",
         help="task id; repeat for several",
     )
-    run.add_argument("--agent", required=True, type=Path, help="agent config YAML file")
-    run.add_argument("--trials", type=_positive_int, default=3, help="trials per task")
-    run.add_argument("--budget-usd", type=float, default=10.0, help="run-level cost ceiling")
-    run.add_argument("--concurrency", type=_positive_int, default=4)
-    run.add_argument("--seed", type=int, help="dispatch order and mock responses (default random)")
-    run.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
-    run.add_argument(
-        "--judge-model", default=DEFAULT_JUDGE_MODEL, help="pinned model for llm_judge graders"
-    )
-    run.add_argument(
-        "--review-rate",
-        type=_fraction,
-        default=REVIEW_RATE,
-        help="fraction of trials sampled for human review",
+    selection.add_argument(
+        "--resume", metavar="RUN_ID", help="continue an unfinished run, e.g. after a crash"
     )
     run.set_defaults(handler=run_command)
+
+    cancel = commands.add_parser("cancel", parents=[common], help="cancel a run (WF-12)")
+    cancel.add_argument("run_id")
+    cancel.set_defaults(handler=cancel_command)
+
+    gc = commands.add_parser(
+        "gc", parents=[common], help="delete old run outputs and orphaned sandboxes"
+    )
+    gc.add_argument(
+        "--older-than",
+        type=_duration,
+        default=_duration("30d"),
+        metavar="AGE",
+        help="age of finished runs whose outputs go, like 30d or 12h (default 30d)",
+    )
+    gc.add_argument("--dry-run", action="store_true", help="report without deleting")
+    gc.set_defaults(handler=gc_command)
+
+    ci = commands.add_parser(
+        "ci", parents=[common, run_options], help="run, compare with a baseline, report (WF-10)"
+    )
+    ci.add_argument("--suite", required=True, help="suite name (suites/<name>.yaml)")
+    ci.add_argument(
+        "--baseline",
+        required=True,
+        metavar="BRANCH",
+        help="compare with the latest completed run labelled branch=BRANCH",
+    )
+    ci.add_argument(
+        "--baseline-agent",
+        type=Path,
+        help="agent config for running the baseline when no recent one exists",
+    )
+    ci.add_argument(
+        "--max-baseline-age",
+        type=_duration,
+        default=_duration("7d"),
+        metavar="AGE",
+        help="an older baseline is stale and is run again (default 7d)",
+    )
+    ci.add_argument(
+        "--override",
+        action="store_true",
+        help="report a regression without failing (the eval-override pull request label)",
+    )
+    ci.add_argument("--comment-file", type=Path, help="also write the comment here")
+    ci.add_argument("--github", action="store_true", help="post the comment on the pull request")
+    ci.add_argument("--pr", type=_positive_int, help="pull request number (default: this event's)")
+    ci.set_defaults(handler=ci_command, tasks=None, resume=None)
 
     report = commands.add_parser("report", parents=[common], help="print a run summary")
     report.add_argument("run_id")
@@ -112,8 +164,39 @@ def _parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", parents=[common], help="REST API and web UI")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8321)
+    serve.add_argument(
+        "--configs-dir",
+        type=Path,
+        default=Path("configs"),
+        help="agent configs that POST /runs may name",
+    )
     serve.set_defaults(handler=_serve_command)
     return parser
+
+
+def _run_options() -> argparse.ArgumentParser:
+    """Options shared by `run` and `ci`."""
+    options = argparse.ArgumentParser(add_help=False)
+    options.add_argument("--agent", type=Path, help="agent config YAML file")
+    options.add_argument("--trials", type=_positive_int, default=3, help="trials per task")
+    options.add_argument("--budget-usd", type=float, default=10.0, help="run-level cost ceiling")
+    options.add_argument(
+        "--concurrency", type=_positive_int, help="trials at once (default 4, or as before)"
+    )
+    options.add_argument(
+        "--seed", type=int, help="dispatch order and mock responses (default random)"
+    )
+    options.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
+    options.add_argument(
+        "--judge-model", default=DEFAULT_JUDGE_MODEL, help="pinned model for llm_judge graders"
+    )
+    options.add_argument(
+        "--review-rate",
+        type=_fraction,
+        default=REVIEW_RATE,
+        help="fraction of trials sampled for human review",
+    )
+    return options
 
 
 def _list_command(args: argparse.Namespace) -> int:
@@ -167,14 +250,25 @@ def _compare_command(args: argparse.Namespace) -> int:
 
 
 def _serve_command(args: argparse.Namespace) -> int:
+    proxy, failure = start_proxy()  # runs started over the API may call real models
+    if failure is not None:
+        return failure
     store = Store(args.home / DB_NAME)
-    token = secrets.token_urlsafe(24)
-    app = create_app(store, args.home, token, frozenset({args.host}))
+    token = os.environ.get(TOKEN_ENV) or secrets.token_urlsafe(24)
+    runs = RunService(
+        Directories(args.tasks_dir.resolve(), args.suites_dir.resolve(), args.home),
+        args.configs_dir.resolve(),
+        DockerBackend(),
+        proxy,
+    )
+    app = create_app(store, args.home, token, frozenset({args.host}), runs=runs)
     print(f"Agentoscopy UI: http://{args.host}:{args.port}/#token={token}", flush=True)
     try:
         web.run_app(app, host=args.host, port=args.port, print=None)
     finally:
         store.close()
+        if proxy:
+            proxy.stop()
     return EXIT_OK
 
 
@@ -183,6 +277,13 @@ def _positive_int(text: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return value
+
+
+def _duration(text: str) -> timedelta:
+    match = DURATION_PATTERN.match(text.strip())
+    if not match:
+        raise argparse.ArgumentTypeError("must be a number and a unit: s, m, h, or d (e.g. 30d)")
+    return timedelta(**{DURATION_UNITS[match.group(2)]: int(match.group(1))})
 
 
 def _fraction(text: str) -> float:

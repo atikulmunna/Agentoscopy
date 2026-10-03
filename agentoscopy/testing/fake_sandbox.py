@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Callable
+from datetime import UTC, datetime
 
-from agentoscopy.sandbox.base import ExecResult, SandboxError
+from agentoscopy.sandbox.base import ExecResult, SandboxError, SandboxRecord
 from agentoscopy.spec import Task
 
 ExecHandler = Callable[[str], ExecResult]
@@ -39,6 +40,7 @@ class FakeSandbox:
         self.destroyed = False
         self.destroy_error: str | None = None
         self.snapshot_id = f"fake-snapshot-{id(self)}"
+        self.created = datetime.now(UTC)
         self._handler = handler
         self._workdir = workdir
         self._on_destroy = on_destroy
@@ -111,6 +113,7 @@ class FakeBackend:
     ) -> None:
         self.agent_sandboxes: list[FakeSandbox] = []
         self.grading_sandboxes: list[FakeSandbox] = []
+        self.trial_of: dict[int, str] = {}  # id(sandbox) -> trial id, as a label would
         self.max_live_agents = 0
         self._live_agents = 0
         self._agent_handler = agent_handler
@@ -131,6 +134,7 @@ class FakeBackend:
             raise SandboxError("injected sandbox failure")
         sandbox = FakeSandbox(self._agent_handler, self._files, on_destroy=self._release_agent)
         self.agent_sandboxes.append(sandbox)
+        self.trial_of[id(sandbox)] = trial_id
         self._live_agents += 1
         self.max_live_agents = max(self.max_live_agents, self._live_agents)
         return sandbox
@@ -140,7 +144,29 @@ class FakeBackend:
         files = dict(source.files)
         grading = FakeSandbox(lambda cmd: self._grader(cmd, files), files)
         self.grading_sandboxes.append(grading)
+        self.trial_of[id(grading)] = trial_id
         return grading
+
+    async def remove_trial_sandboxes(self, trial_id: str) -> None:
+        for sandbox in self._live():
+            if self.trial_of[id(sandbox)] == trial_id:
+                await sandbox.destroy()
+
+    async def list_sandboxes(self) -> list[SandboxRecord]:
+        return [
+            SandboxRecord(
+                "container", str(id(sandbox)), self.trial_of[id(sandbox)], sandbox.created
+            )
+            for sandbox in self._live()
+        ]
+
+    async def remove_sandbox(self, record: SandboxRecord) -> None:
+        for sandbox in self._live():
+            if str(id(sandbox)) == record.ref:
+                await sandbox.destroy()
+
+    def _live(self) -> list[FakeSandbox]:
+        return [s for s in self.agent_sandboxes + self.grading_sandboxes if not s.destroyed]
 
     def _release_agent(self) -> None:
         self._live_agents -= 1

@@ -42,7 +42,18 @@ class CrashingAgent(SleepingAgent):
         raise OSError("teardown broke")
 
 
-def attempt(tmp_path, task, backend, script=None, adapter=None, **spec_fields):
+def attempt(
+    tmp_path,
+    task,
+    backend,
+    script=None,
+    adapter=None,
+    on_state=None,
+    cancel_after=None,
+    **spec_fields,
+):
+    """Run one attempt. `cancel_after` seconds in, or when `on_state` returns True for the
+    state it is told about, the run is cancelled."""
     config = AgentConfig(
         name="test-agent",
         adapter="python",
@@ -60,9 +71,23 @@ def attempt(tmp_path, task, backend, script=None, adapter=None, **spec_fields):
     )
 
     async def scenario():
+        cancel = asyncio.Event()
+        if cancel_after is not None:
+            asyncio.get_running_loop().call_later(cancel_after, cancel.set)
+
+        def state_changed(state):
+            if on_state and on_state(state):
+                cancel.set()
+
         async with running_gateway() as gateway:
             return await run_attempt(
-                spec, adapter or ScriptedAgent(), backend, gateway, tmp_path / "home"
+                spec,
+                adapter or ScriptedAgent(),
+                backend,
+                gateway,
+                tmp_path / "home",
+                on_state=state_changed,
+                cancel=cancel,
             )
 
     return asyncio.run(scenario())
@@ -281,3 +306,51 @@ def test_changes_made_by_setup_are_not_blamed_on_the_agent(make_task, tmp_path):
 
     assert (result.outcome, result.vetoed) == ("pass", False)
     assert result.final_state_path.read_text() == "A /workspace/app.py"
+
+
+class StoppableAgent(SleepingAgent):
+    """Waits until stopped, then records that it was cancelled and torn down."""
+
+    def __init__(self):
+        self.cancelled = self.torn_down = False
+
+    async def run(self, task, sandbox, model_endpoint, budget, recorder):
+        try:
+            await asyncio.sleep(budget.timeout_s + 5)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return AgentResult()
+
+    async def teardown(self):
+        self.torn_down = True
+
+
+def test_a_cancelled_run_stops_the_agent_and_skips_grading(make_task, tmp_path):
+    backend, agent = FakeBackend(grader=passes_when_fixed), StoppableAgent()
+
+    result = attempt(tmp_path, make_task(), backend, adapter=agent, cancel_after=0.3)
+
+    assert (result.outcome, result.termination, result.score) == ("cancelled", "cancelled", 0.0)
+    assert agent.cancelled and agent.torn_down
+    (agent_box,) = backend.agent_sandboxes
+    assert agent_box.destroyed and backend.grading_sandboxes == []
+    end = read_events(result.trajectory_path)[-1]
+    assert (end["type"], end["payload"]["outcome"]) == ("trial_end", "cancelled")
+
+
+def test_a_cancel_before_the_attempt_starts_creates_nothing(make_task, tmp_path):
+    backend = FakeBackend()
+
+    result = attempt(tmp_path, make_task(), backend, cancel_after=0)
+
+    assert result.outcome == "cancelled"
+    assert backend.agent_sandboxes == []
+
+
+def test_a_trial_already_grading_finishes_when_the_run_is_cancelled(make_task, tmp_path):
+    backend = FakeBackend(grader=passes_when_fixed)
+
+    result = attempt(tmp_path, make_task(), backend, on_state=lambda state: state == "GRADING")
+
+    assert (result.outcome, result.termination) == ("pass", "agent_done")

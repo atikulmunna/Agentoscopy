@@ -1,8 +1,10 @@
 import asyncio
+import time
 
 import pytest
 from conftest import BASE_TASK, running_gateway
 
+from agentoscopy.adapters.base import AgentResult
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.scheduler.plan import (
     PlanError,
@@ -256,3 +258,94 @@ def test_unusable_judge_models_are_rejected(validated, model, credentials, code)
 
     with pytest.raises(PlanError, match=code):
         check_judge(judged, model, has_credentials=credentials)
+
+
+class PausingAgent:
+    """Waits a while, then applies the fix, so its trials stay in flight for a bit."""
+
+    name = "pausing"
+
+    def __init__(self, pause_s):
+        self.pause_s = pause_s
+
+    async def setup(self, config):
+        pass
+
+    async def run(self, task, sandbox, model_endpoint, budget, recorder):
+        await asyncio.sleep(self.pause_s)
+        await sandbox.write_file("app.py", b"fixed")
+        return AgentResult(final_message="done")
+
+    async def teardown(self):
+        pass
+
+
+def run_paused(store, tmp_path, pinned, pause_s, trials, during=None, before=None, **options):
+    """Execute a run of PausingAgent trials; `during(run_id)` runs alongside the executor and
+    `before(run_id)` runs first."""
+    agent_config = config([])
+    settings = RunSettings(
+        suite_id=None, suite_version=None, trials_per_task=trials, budget_usd=None, seed=3,
+        concurrency=2, harness_version="test",
+    )  # fmt: skip
+    run_id = store.create_run(agent_config, settings, plan_trials(pinned, trials, seed=3))
+    if before:
+        before(run_id)
+
+    async def scenario():
+        async with running_gateway() as gateway:
+            executor = RunExecutor(
+                store, run_id, pinned, agent_config, FakeBackend(grader=passes_when_fixed),
+                gateway, tmp_path / "home", concurrency=2, seed=3,
+                adapter_factory=lambda _: PausingAgent(pause_s), **options,
+            )  # fmt: skip
+            running = asyncio.create_task(executor.execute())
+            if during:
+                await during(run_id)
+            await running
+
+    asyncio.run(scenario())
+    return run_id
+
+
+def test_a_cancel_request_stops_a_running_run(store, tmp_path, validated):
+    pinned = validated("task-a")
+
+    async def cancel_after_first_trial(run_id):
+        while store.progress(run_id)[0] == 0:
+            await asyncio.sleep(0.05)
+        store.request_cancel(run_id)
+
+    run_id = run_paused(store, tmp_path, pinned, 0.4, trials=6, during=cancel_after_first_trial)
+
+    outcomes = sorted(row["outcome"] for row in store.trial_rows(run_id))
+    assert store.run_status(run_id) == "cancelled"
+    assert "pass" in outcomes and "cancelled" in outcomes
+    assert set(outcomes) == {"pass", "cancelled"}  # nothing left queued or in flight
+
+
+def test_a_dead_workers_trial_is_reclaimed_and_run_again(store, tmp_path, validated):
+    pinned = validated("task-a")
+    dead = {}
+
+    def die_holding_a_trial(run_id):  # a process that claimed a trial, then was killed
+        dead["trial"] = store.claim_next(run_id, "dead:1:0", now=time.time() - 100, lease_s=1).trial
+
+    run_id = run_paused(
+        store, tmp_path, pinned, 0.05, trials=3, before=die_holding_a_trial, heartbeat_s=0.1
+    )
+
+    assert store.run_status(run_id) == "completed"
+    assert {row["outcome"] for row in store.trial_rows(run_id)} == {"pass"}
+    attempts = store.get_trial(dead["trial"].trial_id)["attempts"]
+    assert [(a["attempt"], a["error_code"]) for a in attempts] == [(1, "WORKER_LOST"), (2, None)]
+
+
+def test_leases_are_renewed_while_trials_run(store, tmp_path, validated):
+    pinned = validated("task-a")
+
+    run_id = run_paused(store, tmp_path, pinned, 1.0, trials=2, lease_s=0.4, heartbeat_s=0.1)
+
+    rows = store.trial_rows(run_id)
+    assert {row["outcome"] for row in rows} == {"pass"}
+    assert {row["attempt"] for row in rows} == {1}  # never reclaimed from under its worker

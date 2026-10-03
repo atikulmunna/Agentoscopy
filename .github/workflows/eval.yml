@@ -1,0 +1,74 @@
+# Agent evaluation gate (WF-10). On a pull request it runs the example suite with the agent
+# config, compares the result with the latest run on main, and comments the verdict on the
+# pull request; a regression fails the check unless the pull request has the eval-override
+# label. Each push to main refreshes that baseline. The configs here call the mock model, so
+# no API key is needed; for real models, add ANTHROPIC_API_KEY as a repository secret.
+name: Agent eval
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: agent-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AGENT: configs/scripted-fix.yaml
+  RUN_OPTIONS: --suite example --trials 4 --seed 1 --judge-model mock
+
+jobs:
+  baseline:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync
+      - run: uv run agentoscopy task validate --all --judge-model mock
+      - run: uv run agentoscopy run $RUN_OPTIONS --agent "$AGENT" --label branch=main
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - uses: actions/cache/save@v6
+        with:
+          path: .agentoscopy
+          key: agentoscopy-main-${{ github.sha }}
+
+  evaluate:
+    # Pull requests from forks never run with provider credentials (WF-10, §2.7).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync
+      - name: Restore the latest baseline from main
+        uses: actions/cache/restore@v6
+        with:
+          path: .agentoscopy
+          key: agentoscopy-main-${{ github.event.pull_request.base.sha }}
+          restore-keys: agentoscopy-main-
+      - name: Agent config on main, to run a baseline if none was restored
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --depth=1 origin "$BASE_REF"
+          git show "FETCH_HEAD:$AGENT" > "$RUNNER_TEMP/baseline-agent.yaml"
+      - run: uv run agentoscopy task validate --all --judge-model mock
+      - name: Evaluate and comment on the pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HEAD_REF: ${{ github.head_ref }}
+          OVERRIDE: ${{ contains(github.event.pull_request.labels.*.name, 'eval-override') && '--override' || '' }}
+        run: >-
+          uv run agentoscopy ci $RUN_OPTIONS --agent "$AGENT"
+          --baseline main --baseline-agent "$RUNNER_TEMP/baseline-agent.yaml"
+          --label "branch=$HEAD_REF" --github $OVERRIDE

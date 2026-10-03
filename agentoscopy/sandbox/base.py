@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from agentoscopy.spec import Task
@@ -16,6 +17,16 @@ class ExecResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class SandboxRecord:
+    """A container or snapshot image that belongs to a trial, as the backend reports it."""
+
+    kind: str  # container | image
+    ref: str
+    trial_id: str
+    created: datetime
 
 
 class SandboxError(Exception):
@@ -63,3 +74,13 @@ class SandboxBackend(Protocol):
     async def create_grading(self, snapshot: str, task: Task, trial_id: str) -> ManagedSandbox:
         """Start a grading sandbox from a snapshot, with hidden/ mounted read-only (AD-4)."""
         ...
+
+    async def remove_trial_sandboxes(self, trial_id: str) -> None:
+        """Remove everything a trial left behind after its process died (FR-EXE-06)."""
+        ...
+
+    async def list_sandboxes(self) -> list[SandboxRecord]:
+        """Every sandbox and snapshot that belongs to some trial, for garbage collection."""
+        ...
+
+    async def remove_sandbox(self, record: SandboxRecord) -> None: ...

@@ -25,6 +25,7 @@ from agentoscopy.sandbox.recording import RecordingSandbox
 from agentoscopy.spec import AgentConfig, Task, config_hash
 
 SETUP_TIMEOUT_S = 600
+CANCEL_GRACE_S = 30.0  # how long a stopped agent gets to wind down (WF-12)
 ERROR_TAIL_CHARS = 2000
 RETRYABLE_ERROR_CODES = frozenset({"SANDBOX_ERROR", "PROVIDER_ERROR"})
 
@@ -42,6 +43,10 @@ class TaskImageChanged(Exception):
 
 class ProviderError(Exception):
     """The model provider stayed unavailable after the gateway's retries (WF-04 E3)."""
+
+
+class AttemptCancelled(Exception):
+    """The run is being cancelled, and this attempt had not reached grading (WF-12)."""
 
 
 INFRA_ERRORS: tuple[tuple[type[Exception], str], ...] = (
@@ -68,7 +73,7 @@ class AttemptSpec:
 
 @dataclass(frozen=True)
 class AttemptResult:
-    outcome: str  # pass | fail | infra_error
+    outcome: str  # pass | fail | infra_error | cancelled
     termination: str | None
     score: float
     grades: list[GradeResult]
@@ -121,7 +126,9 @@ async def run_attempt(
     gateway: Gateway,
     output_root: Path,
     on_state: StateCallback | None = None,
+    cancel: asyncio.Event | None = None,
 ) -> AttemptResult:
+    """Run one attempt. Setting `cancel` stops it unless it is already grading."""
     trajectory_path, artifacts_dir = attempt_paths(
         output_root, spec.run_id, spec.trial_id, spec.attempt
     )
@@ -132,8 +139,17 @@ async def run_attempt(
         recorder.write("trial_start", _start_payload(spec))
         try:
             outcome = await _execute(
-                spec, adapter, backend, gateway, recorder, resources, on_state or _ignore_state
+                spec,
+                adapter,
+                backend,
+                gateway,
+                recorder,
+                resources,
+                on_state or _ignore_state,
+                cancel or asyncio.Event(),
             )
+        except AttemptCancelled:
+            outcome = _Outcome("cancelled", termination="cancelled")
         except tuple(error_class for error_class, _ in INFRA_ERRORS) as exc:
             outcome = _Outcome("infra_error", error_code=_error_code(exc), error=str(exc))
         finally:
@@ -171,8 +187,10 @@ async def _execute(
     recorder: TrajectoryRecorder,
     resources: _Resources,
     on_state: StateCallback,
+    cancel: asyncio.Event,
 ) -> _Outcome:
     task = spec.task
+    _check(cancel)
     image = await backend.prepare_image(task)
     if spec.image_digest and image != spec.image_digest:
         raise TaskImageChanged(
@@ -183,11 +201,14 @@ async def _execute(
     resources.sandboxes.append(sandbox)
     await run_setup(sandbox, task)
     baseline = await sandbox.diff() if task.spec.environment.setup else ""
+    _check(cancel)
     session = gateway.open_session(spec.trial_id, task.spec.budget, recorder, spec.seed_key)
     resources.session = session
     on_state("RUNNING")
     try:
-        termination, final_message = await _run_agent(spec, adapter, sandbox, recorder, session)
+        termination, final_message = await _run_agent(
+            spec, adapter, sandbox, recorder, session, cancel
+        )
     finally:
         gateway.close_session(session)
     if session.provider_error:
@@ -245,8 +266,10 @@ async def _run_agent(
     sandbox: ManagedSandbox,
     recorder: TrajectoryRecorder,
     session: TrialSession,
+    cancel: asyncio.Event,
 ) -> tuple[str, str | None]:
-    """Run the agent. Budgets, timeouts, and crashes are agent outcomes and still get graded."""
+    """Run the agent. Budgets, timeouts, and crashes are agent outcomes and still get graded;
+    a cancelled run is not, so AttemptCancelled passes through."""
     task = spec.task
     context = TaskContext(task.spec.id, task.spec.instructions, task.spec.environment.workdir)
     agent_sandbox = RecordingSandbox(sandbox, recorder)
@@ -259,10 +282,13 @@ async def _run_agent(
             ),
             task.spec.budget.timeout_s,
             extension=lambda: session.backoff_s,
+            cancel=cancel,
         )
         termination, final_message = "agent_done", result.final_message
     except TimeoutError:
         termination = "timeout"
+    except AttemptCancelled:
+        raise
     except Exception as exc:  # agent code is arbitrary; a crash counts against the agent
         recorder.write("error", {"source": "agent", "message": f"{type(exc).__name__}: {exc}"})
         termination = "agent_error"
@@ -274,25 +300,36 @@ async def _run_agent(
 
 
 async def _with_deadline(
-    coroutine: Awaitable[T], timeout_s: float, extension: Callable[[], float]
+    coroutine: Awaitable[T],
+    timeout_s: float,
+    extension: Callable[[], float],
+    cancel: asyncio.Event | None = None,
 ) -> T:
-    """Await `coroutine`, cancelling it after timeout_s plus extension() seconds.
+    """Await `coroutine`, cancelling it after timeout_s plus extension() seconds, or as soon
+    as `cancel` is set (raising AttemptCancelled).
 
     The extension can grow while waiting: provider backoff must not become an agent timeout.
+    A stopped coroutine gets CANCEL_GRACE_S to wind down before the caller moves on.
     """
     task = asyncio.ensure_future(coroutine)
+    stop = asyncio.ensure_future(cancel.wait()) if cancel else None
+    waiters = {task} if stop is None else {task, stop}
     started = time.monotonic()
     try:
         while not task.done():
+            if cancel is not None and cancel.is_set():
+                raise AttemptCancelled
             remaining = started + timeout_s + extension() - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
-            await asyncio.wait({task}, timeout=remaining)
+            await asyncio.wait(waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
         return task.result()
     finally:
+        if stop is not None:
+            stop.cancel()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait({task}, timeout=CANCEL_GRACE_S)
 
 
 async def _teardown(adapter: AgentAdapter, recorder: TrajectoryRecorder) -> None:
@@ -312,6 +349,30 @@ async def _destroy(sandboxes: list[ManagedSandbox], recorder: TrajectoryRecorder
             errors.append(str(exc))
             recorder.write("error", {"source": "sandbox", "message": str(exc)})
     return errors
+
+
+def recorded_spend(
+    output_root: Path, run_id: str, trial_id: str, attempt: int
+) -> tuple[float, float]:
+    """(agent, judge) spend recorded by an attempt that never finished, read back from its
+    trajectory and grading log: abandoned attempts still count toward the run (WF-04 E5)."""
+    trajectory, artifacts = attempt_paths(output_root, run_id, trial_id, attempt)
+    return _logged_cost(trajectory), _logged_cost(artifacts / "grading.jsonl")
+
+
+def _logged_cost(path: Path) -> float:
+    if not path.is_file():
+        return 0.0
+    return sum(
+        event["payload"].get("cost_usd") or 0.0
+        for event in read_events(path)
+        if event["type"] == "model_response"
+    )
+
+
+def _check(cancel: asyncio.Event) -> None:
+    if cancel.is_set():
+        raise AttemptCancelled
 
 
 def _error_code(exc: Exception) -> str:

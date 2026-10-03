@@ -1,17 +1,13 @@
-"""`agentoscopy run`: pin tasks, create the run, start the gateway, run, and print the summary."""
+"""`agentoscopy run`: create or resume a run, execute it, and print the summary."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import secrets
 import sys
 import time
-from dataclasses import dataclass
-from importlib.metadata import version
 from pathlib import Path
 
-from agentoscopy.adapters.python import AdapterLoadError, load_python_adapter
 from agentoscopy.cli.common import (
     DB_NAME,
     EXIT_ENVIRONMENT,
@@ -21,39 +17,31 @@ from agentoscopy.cli.common import (
 )
 from agentoscopy.gateway.credential_proxy import CredentialProxy
 from agentoscopy.gateway.server import Gateway
+from agentoscopy.launch import (
+    DEFAULT_CONCURRENCY,
+    Directories,
+    LaunchError,
+    PreparedRun,
+    RunRequest,
+    create_run,
+    execute_run,
+    resume_run,
+)
 from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.docker import DockerBackend
-from agentoscopy.scheduler.plan import (
-    PinnedTask,
-    PlanError,
-    check_budget,
-    check_judge,
-    estimate_cost,
-    pin_tasks,
-    plan_trials,
-)
-from agentoscopy.scheduler.runner import RunExecutor, TrialProgress
-from agentoscopy.spec import AgentConfig, SpecError, config_hash, load_agent_config, load_suite
+from agentoscopy.scheduler.plan import estimate_cost
+from agentoscopy.scheduler.runner import TrialProgress
+from agentoscopy.spec import config_hash
 from agentoscopy.stats.report import render
-from agentoscopy.storage.store import RunSettings, Store
+from agentoscopy.storage.store import Store
 
-
-@dataclass(frozen=True)
-class _Prepared:
-    pinned: list[PinnedTask]
-    config: AgentConfig
-    settings: RunSettings
-    review_rate: float
+EXIT_BY_STATUS = {"completed": EXIT_OK, "cancelled": EXIT_INTERRUPTED}
 
 
 def run_command(args: argparse.Namespace) -> int:
-    # Start the credential proxy first: it takes the API key out of this process before any
-    # agent code is imported (NFR-SEC-01).
-    try:
-        proxy = CredentialProxy.start_if_configured()
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_ENVIRONMENT
+    proxy, failure = start_proxy()
+    if failure is not None:
+        return failure
     store = Store(args.home / DB_NAME)
     try:
         return _run(args, store, proxy)
@@ -63,87 +51,102 @@ def run_command(args: argparse.Namespace) -> int:
             proxy.stop()
 
 
-def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
+def start_proxy() -> tuple[CredentialProxy | None, int | None]:
+    """Start the credential proxy first: it takes the API key out of this process before any
+    agent code is imported (NFR-SEC-01). Returns (proxy, exit code on failure)."""
     try:
-        prepared = _prepare(args, store, has_credentials=proxy is not None)
-    except (SpecError, PlanError, AdapterLoadError, ValueError) as exc:
+        return CredentialProxy.start_if_configured(), None
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None, EXIT_ENVIRONMENT
+
+
+def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
+    dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
+    try:
+        if args.resume:
+            prepared = resume_run(
+                store,
+                dirs,
+                args.resume,
+                has_credentials=proxy is not None,
+                concurrency=args.concurrency,
+            )
+        else:
+            prepared = create_run(store, dirs, run_request(args), has_credentials=proxy is not None)
+    except (LaunchError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INVALID_INPUT
-    settings = prepared.settings
-    estimate = estimate_cost(
-        store, prepared.pinned, config_hash(prepared.config), settings.trials_per_task
+    status = execute_with_progress(store, prepared, args.home, proxy, resumed=bool(args.resume))
+    if status is None:
+        return EXIT_ENVIRONMENT
+    print()
+    print(render(run_summary(store, prepared.run_id), store.get_run(prepared.run_id), "table"))
+    return EXIT_BY_STATUS.get(status, EXIT_ENVIRONMENT)
+
+
+def run_request(args: argparse.Namespace, extra_labels: dict[str, str] | None = None) -> RunRequest:
+    if not args.agent:
+        raise ValueError("--agent is required unless you pass --resume")
+    return RunRequest(
+        agent=args.agent,
+        suite=args.suite,
+        tasks=tuple(args.tasks or ()),
+        trials=args.trials,
+        budget_usd=args.budget_usd,
+        concurrency=args.concurrency or DEFAULT_CONCURRENCY,
+        seed=args.seed,
+        labels={**labels(args.label), **(extra_labels or {})},
+        judge_model=args.judge_model,
+        review_rate=args.review_rate,
     )
-    truncation = " (likely truncated)" if estimate > settings.budget_usd else ""
-    print(f"estimated cost ${estimate:.2f}, budget ${settings.budget_usd:.2f}{truncation}")
-    trials = plan_trials(prepared.pinned, settings.trials_per_task, settings.seed)
-    run_id = store.create_run(prepared.config, settings, trials)
+
+
+def execute_with_progress(
+    store: Store,
+    prepared: PreparedRun,
+    home: Path,
+    proxy: CredentialProxy | None,
+    *,
+    resumed: bool = False,
+) -> str | None:
+    """Execute a prepared run with live progress. Returns its final status, or None after a
+    harness failure (reported on stderr)."""
+    settings = prepared.settings
+    if not resumed:
+        estimate = estimate_cost(
+            store, prepared.pinned, config_hash(prepared.config), settings.trials_per_task
+        )
+        budget = settings.budget_usd
+        truncation = " (likely truncated)" if budget is not None and estimate > budget else ""
+        budget_text = "none" if budget is None else f"${budget:.2f}"
+        print(f"estimated cost ${estimate:.2f}, budget {budget_text}{truncation}")
+    finished, total = store.progress(prepared.run_id)
+    action = f"resuming at {finished} of {total} trials" if resumed else f"{total} trials"
     print(
-        f"run {run_id}: {len(trials)} trials, concurrency {settings.concurrency}, "
+        f"run {prepared.run_id}: {action}, concurrency {settings.concurrency}, "
         f"seed {settings.seed}",
         flush=True,
     )
     try:
-        asyncio.run(_execute(store, run_id, prepared, args.home, proxy))
+        return asyncio.run(_execute(store, prepared, home, proxy))
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)
-        return EXIT_INTERRUPTED
+        return "cancelled"
     except Exception as exc:  # report any harness failure with its cause, then fail the command
         print(f"error: run failed: {_describe(exc)}", file=sys.stderr)
-        return EXIT_ENVIRONMENT
-    run = store.get_run(run_id)
-    summary = run_summary(store, run_id, refresh=True)
-    store.save_summary(run_id, summary)
-    print()
-    print(render(summary, run, "table"))
-    return EXIT_OK
-
-
-def _prepare(args: argparse.Namespace, store: Store, *, has_credentials: bool) -> _Prepared:
-    task_ids = load_suite(args.suites_dir, args.suite).tasks if args.suite else args.tasks
-    pinned = pin_tasks(store, args.tasks_dir, task_ids)
-    check_budget(pinned, args.budget_usd)
-    judge_model = check_judge([item.task for item in pinned], args.judge_model, has_credentials)
-    config = load_agent_config(args.agent)
-    load_python_adapter(config.entrypoint)  # fail before the run exists if it cannot load
-    suite_version = None
-    if args.suite:
-        refs = [(item.task.spec.id, item.version) for item in pinned]
-        suite_version = store.save_suite_version(args.suite, refs)
-    settings = RunSettings(
-        suite_id=args.suite,
-        suite_version=suite_version,
-        trials_per_task=args.trials,
-        budget_usd=args.budget_usd,
-        seed=args.seed if args.seed is not None else secrets.randbelow(2**31),
-        concurrency=args.concurrency,
-        harness_version=version("agentoscopy"),
-        labels=_labels(args.label),
-        judge_model=judge_model,
-    )
-    return _Prepared(pinned, config, settings, args.review_rate)
+        return None
 
 
 async def _execute(
-    store: Store, run_id: str, prepared: _Prepared, home: Path, proxy: CredentialProxy | None
-) -> None:
+    store: Store, prepared: PreparedRun, home: Path, proxy: CredentialProxy | None
+) -> str:
     gateway = Gateway(proxy.url if proxy else None, proxy.secret if proxy else None)
     await gateway.start()
     try:
-        executor = RunExecutor(
-            store,
-            run_id,
-            prepared.pinned,
-            prepared.config,
-            DockerBackend(),
-            gateway,
-            home,
-            concurrency=prepared.settings.concurrency,
-            seed=prepared.settings.seed,
-            on_progress=_ProgressPrinter(),
-            judge_model=prepared.settings.judge_model,
-            review_rate=prepared.review_rate,
+        return await execute_run(
+            store, prepared, home, DockerBackend(), gateway, on_progress=_ProgressPrinter()
         )
-        await executor.execute()
     finally:
         await gateway.stop()
 
@@ -175,14 +178,14 @@ class _ProgressPrinter:
         )
 
 
-def _labels(pairs: list[str]) -> dict[str, str]:
-    labels = {}
+def labels(pairs: list[str]) -> dict[str, str]:
+    parsed = {}
     for pair in pairs:
         key, separator, value = pair.partition("=")
         if not separator or not key:
             raise ValueError(f"label {pair!r} must look like KEY=VALUE")
-        labels[key] = value
-    return labels
+        parsed[key] = value
+    return parsed
 
 
 def _describe(exc: BaseException) -> str:

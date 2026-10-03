@@ -8,7 +8,6 @@ EXIT_INVALID_INPUT = 2
 EXIT_ENVIRONMENT = 3
 EXIT_INTERRUPTED = 130
 DB_NAME = "agentoscopy.db"
-DEFAULT_JUDGE_MODEL = "claude-opus-5-5"
 
 
 def all_task_ids(tasks_dir: Path) -> list[str]:

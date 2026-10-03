@@ -19,6 +19,7 @@ from aiohttp import web
 from yarl import URL
 
 from agentoscopy.api import reviews
+from agentoscopy.api import runs as run_api
 from agentoscopy.api.common import (
     ALLOWED_HOSTS,
     HOME,
@@ -27,8 +28,12 @@ from agentoscopy.api.common import (
     ApiError,
     int_query,
 )
+from agentoscopy.api.runs import RunService
+from agentoscopy.launch import Directories
+from agentoscopy.metrics import CONTENT_TYPE, render_metrics
 from agentoscopy.recorder.trajectory import read_events
 from agentoscopy.reporting import NotFound, comparison, run_summary, safe_artifact
+from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.storage.store import Store
 
@@ -43,7 +48,11 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
 def create_app(
-    store: Store, home: Path, token: str, extra_hosts: frozenset[str] = frozenset()
+    store: Store,
+    home: Path,
+    token: str,
+    extra_hosts: frozenset[str] = frozenset(),
+    runs: RunService | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[_guard])
     app[STORE], app[HOME], app[TOKEN] = store, home.resolve(), token
@@ -59,7 +68,10 @@ def create_app(
     app.router.add_get("/trials/{trial_id}/diff", _get_diff)
     app.router.add_get("/compare", _compare)
     app.router.add_get("/events", _events)
+    app.router.add_get("/metrics", _metrics)
     reviews.add_routes(app)
+    default_dirs = Directories(Path("tasks"), Path("suites"), home)
+    run_api.add_routes(app, runs or RunService(default_dirs, Path("configs"), DockerBackend()))
     return app
 
 
@@ -158,6 +170,13 @@ async def _compare(request: web.Request) -> web.Response:
     drift = request.query.get("allow_version_drift", "").lower() in ("1", "true", "yes")
     result = comparison(request.app[STORE], base, cand, allow_version_drift=drift)
     return web.json_response(result)
+
+
+async def _metrics(request: web.Request) -> web.Response:
+    """Prometheus metrics (NFR-OBS-02). Scrapers send the token like any other client."""
+    return web.Response(
+        body=render_metrics(request.app[STORE]).encode(), headers={"Content-Type": CONTENT_TYPE}
+    )
 
 
 async def _events(request: web.Request) -> web.StreamResponse:

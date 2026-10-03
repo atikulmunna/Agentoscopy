@@ -1,7 +1,9 @@
 """Results database (§14.3, SQLite): task versions, suites, configs, runs, trials, and grades.
 
-The job queue lives here too (AD-2): workers claim queued trials with a conditional update,
-and an attempt is finalised only by the worker that still holds it (FR-EXE-01, FR-EXE-05).
+The job queue lives here too (AD-2): workers claim queued trials with a conditional update
+and hold them under a lease their process keeps renewing. An attempt is finalised only by
+the worker that still holds it (FR-EXE-01, FR-EXE-05), and a trial whose lease ran out
+because its process died can be reclaimed (FR-EXE-06).
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +23,9 @@ from agentoscopy.spec import AgentConfig, Task, config_hash
 from agentoscopy.worker.trial import AttemptResult
 
 IN_FLIGHT_STATES = ("PROVISIONING", "RUNNING", "GRADING")
-SCHEMA_VERSION = 2  # bump whenever SCHEMA changes
+ACTIVE_RUN_STATUSES = ("pending", "running", "cancelling")
+LEASE_S = 30.0  # a worker's process renews its leases well within this (FR-EXE-01)
+SCHEMA_VERSION = 3  # bump whenever SCHEMA changes, and add a migration
 REVIEW_PRIORITY = "CASE sample_source WHEN 'low_confidence' THEN 0 WHEN 'random' THEN 1 ELSE 2 END"
 RUN_LISTING = """
 SELECT runs.*, agent_configs.name AS config_name, run_summaries.summary AS summary,
@@ -35,6 +39,8 @@ LEFT JOIN agent_configs USING (config_hash)
 LEFT JOIN run_summaries USING (run_id)
 """
 BUDGET_EPSILON_USD = 1e-9
+WORKER_LOST = "WORKER_LOST"
+WORKER_LOST_MESSAGE = "the worker stopped renewing its lease: its process died or hung"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS task_versions (
@@ -56,7 +62,7 @@ CREATE TABLE IF NOT EXISTS runs (
   config_hash TEXT REFERENCES agent_configs, trials_per_task INTEGER, mode TEXT, status TEXT,
   budget_usd REAL, seed INTEGER, concurrency INTEGER, flags TEXT NOT NULL DEFAULT '[]',
   labels TEXT NOT NULL DEFAULT '{}', harness_version TEXT, judge_model TEXT,
-  created_at TEXT, finished_at TEXT
+  created_at TEXT, finished_at TEXT, review_rate REAL
 );
 CREATE TABLE IF NOT EXISTS trials (
   trial_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs,
@@ -69,12 +75,14 @@ CREATE TABLE IF NOT EXISTS trials (
   not_before REAL NOT NULL DEFAULT 0, trajectory_uri TEXT, final_state_uri TEXT,
   judge_cost_usd REAL NOT NULL DEFAULT 0,
   original_outcome TEXT,  -- set when a reviewer overrides the outcome (FR-REV-06)
+  lease_expires_at REAL,  -- epoch seconds; renewed while the trial is in flight
   UNIQUE (run_id, task_id, trial_index)
 );
 CREATE TABLE IF NOT EXISTS trial_attempts (
   trial_id TEXT NOT NULL REFERENCES trials, attempt INTEGER NOT NULL, worker_id TEXT,
   outcome TEXT, error_code TEXT, error TEXT, cost_usd REAL NOT NULL DEFAULT 0,
   judge_cost_usd REAL NOT NULL DEFAULT 0, trajectory_uri TEXT, started_at TEXT, ended_at TEXT,
+  model_calls INTEGER NOT NULL DEFAULT 0, model_latency_s REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (trial_id, attempt)
 );
 CREATE TABLE IF NOT EXISTS grades (
@@ -100,8 +108,18 @@ CREATE TABLE IF NOT EXISTS failure_tags (
   note TEXT, PRIMARY KEY (trial_id, tag)
 );
 CREATE INDEX IF NOT EXISTS idx_trials_run_state ON trials (run_id, state);
+CREATE INDEX IF NOT EXISTS idx_trials_lease ON trials (state, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_reviews_pending ON reviews (reviewed_at, sample_source);
 """
+# Upgrades from each older schema version to the next; SCHEMA then adds any new indexes.
+MIGRATIONS = {
+    2: """
+ALTER TABLE runs ADD COLUMN review_rate REAL;
+ALTER TABLE trials ADD COLUMN lease_expires_at REAL;
+ALTER TABLE trial_attempts ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE trial_attempts ADD COLUMN model_latency_s REAL NOT NULL DEFAULT 0;
+""",
+}
 
 
 class StoreError(Exception):
@@ -157,6 +175,7 @@ class RunSettings:
     harness_version: str
     labels: dict[str, str] = field(default_factory=dict)
     judge_model: str | None = None
+    review_rate: float | None = None
 
 
 class Store:
@@ -169,12 +188,21 @@ class Store:
         fresh = not self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table'"
         ).fetchone()
-        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if not fresh and version != SCHEMA_VERSION:
+        version = (
+            SCHEMA_VERSION if fresh else self._conn.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if version != SCHEMA_VERSION and not all(
+            step in MIGRATIONS for step in range(version, SCHEMA_VERSION)
+        ):
             self._conn.close()
             raise StoreError(
                 f"{path} uses schema version {version}, but this release needs {SCHEMA_VERSION}; "
                 "move it aside to start a fresh database"
+            )
+        for step in range(version, SCHEMA_VERSION):
+            # executescript commits first, so each upgrade is its own transaction.
+            self._conn.executescript(
+                f"BEGIN; {MIGRATIONS[step]} PRAGMA user_version = {step + 1}; COMMIT;"
             )
         self._conn.executescript(SCHEMA)
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -278,8 +306,8 @@ class Store:
             conn.execute(
                 "INSERT INTO runs (run_id, suite_id, suite_version, config_hash, trials_per_task, "
                 "mode, status, budget_usd, seed, concurrency, labels, harness_version, "
-                "judge_model, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 'live', 'pending', ?, ?, ?, ?, ?, ?, ?)",
+                "judge_model, review_rate, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'live', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     settings.suite_id,
@@ -292,6 +320,7 @@ class Store:
                     json.dumps(settings.labels),
                     settings.harness_version,
                     settings.judge_model,
+                    settings.review_rate,
                     _now(),
                 ),
             )
@@ -324,6 +353,42 @@ class Store:
         )
         return [_run_dict(row) for row in rows]
 
+    def run_status(self, run_id: str) -> str | None:
+        row = self._conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        return row["status"] if row else None
+
+    def mark_running(self, run_id: str) -> None:
+        """A run being executed, or resumed after a crash or a harness failure. A run that is
+        being cancelled stays that way."""
+        self._conn.execute(
+            "UPDATE runs SET status = 'running', finished_at = NULL "
+            "WHERE run_id = ? AND status IN ('pending', 'running', 'failed')",
+            (run_id,),
+        )
+
+    def request_cancel(self, run_id: str) -> str | None:
+        """Ask a run to stop (WF-12). Queued trials are cancelled at once; trials in flight
+        are stopped by the process running them. Returns the run's status afterwards
+        (`cancelled` once nothing is in flight), or None if there is no such run."""
+        with self._transaction() as conn:
+            status = self.run_status(run_id)
+            if status not in ACTIVE_RUN_STATUSES:
+                return status
+            conn.execute("UPDATE runs SET status = 'cancelling' WHERE run_id = ?", (run_id,))
+            _cancel_queued(conn, run_id)
+        self.finalize_cancel(run_id)
+        return self.run_status(run_id)
+
+    def finalize_cancel(self, run_id: str) -> bool:
+        """Mark a cancelling run cancelled once none of its trials is in flight."""
+        cursor = self._conn.execute(
+            "UPDATE runs SET status = 'cancelled', finished_at = ? "
+            "WHERE run_id = ? AND status = 'cancelling' AND NOT EXISTS "
+            "(SELECT 1 FROM trials WHERE run_id = ? AND state IN (?, ?, ?))",
+            (_now(), run_id, run_id, *IN_FLIGHT_STATES),
+        )
+        return cursor.rowcount == 1
+
     def set_run_status(self, run_id: str, status: str, finished: bool = False) -> None:
         self._conn.execute(
             "UPDATE runs SET status = ?, finished_at = CASE WHEN ? THEN ? ELSE finished_at END "
@@ -343,10 +408,15 @@ class Store:
 
     # Queue --------------------------------------------------------------------------------
 
-    def claim_next(self, run_id: str, worker_id: str, now: float | None = None) -> Claim:
+    def claim_next(
+        self, run_id: str, worker_id: str, now: float | None = None, lease_s: float = LEASE_S
+    ) -> Claim:
         """Claim the next trial in dispatch order if the run budget can reserve its cap."""
         now = time.time() if now is None else now
         with self._transaction() as conn:
+            if self.run_status(run_id) == "cancelling":
+                _cancel_queued(conn, run_id)  # including retries queued after the request
+                return Claim("empty")
             ready = conn.execute(
                 "SELECT * FROM trials WHERE run_id = ? AND state = 'QUEUED' AND not_before <= ? "
                 "ORDER BY dispatch_order LIMIT 1",
@@ -363,22 +433,87 @@ class Store:
             attempt = ready["attempt"] + 1
             conn.execute(
                 "UPDATE trials SET state = 'PROVISIONING', attempt = ?, worker_id = ?, "
-                "reserved_usd = cost_cap_usd WHERE trial_id = ? AND state = 'QUEUED'",
-                (attempt, worker_id, ready["trial_id"]),
+                "reserved_usd = cost_cap_usd, lease_expires_at = ? "
+                "WHERE trial_id = ? AND state = 'QUEUED'",
+                (attempt, worker_id, now + lease_s, ready["trial_id"]),
             )
             conn.execute(
                 "INSERT INTO trial_attempts (trial_id, attempt, worker_id, started_at) "
                 "VALUES (?, ?, ?, ?)",
                 (ready["trial_id"], attempt, worker_id, _now()),
             )
-        trial = ClaimedTrial(
-            ready["trial_id"],
-            ready["task_id"],
-            ready["task_version"],
-            ready["trial_index"],
-            attempt,
+        return Claim("claimed", trial=replace(_claimed(ready), attempt=attempt))
+
+    def renew_leases(self, run_id: str, worker_ids: list[str], until: float) -> int:
+        """Extend the leases on every trial these workers hold (the heartbeat, FR-EXE-01)."""
+        marks = ", ".join("?" * len(worker_ids))
+        cursor = self._conn.execute(
+            f"UPDATE trials SET lease_expires_at = ? WHERE run_id = ? AND worker_id IN ({marks}) "
+            "AND state IN (?, ?, ?)",
+            (until, run_id, *worker_ids, *IN_FLIGHT_STATES),
         )
-        return Claim("claimed", trial=trial)
+        return cursor.rowcount
+
+    def expired_trials(self, run_id: str, now: float | None = None) -> list[ClaimedTrial]:
+        """Trials in flight whose lease ran out: the process holding them died or hung."""
+        rows = self._conn.execute(
+            "SELECT * FROM trials WHERE run_id = ? AND state IN (?, ?, ?) "
+            "AND COALESCE(lease_expires_at, 0) < ? ORDER BY dispatch_order",
+            (run_id, *IN_FLIGHT_STATES, time.time() if now is None else now),
+        )
+        return [_claimed(row) for row in rows]
+
+    def abandon_attempt(
+        self,
+        trial: ClaimedTrial,
+        *,
+        state: str,
+        cost_usd: float,
+        judge_cost_usd: float,
+        now: float | None = None,
+    ) -> bool:
+        """Close an attempt whose lease ran out (WF-04 E5). The attempt becomes an infra error
+        (`WORKER_LOST`) that keeps what it spent, and the trial moves to `state`: QUEUED for
+        a retry, INFRA_ERROR, or CANCELLED. Changes nothing if the lease was renewed since."""
+        if state not in ("QUEUED", "INFRA_ERROR", "CANCELLED"):
+            raise ValueError(f"cannot abandon an attempt into state {state}")
+        now = time.time() if now is None else now
+        outcome = {"INFRA_ERROR": "infra_error", "CANCELLED": "cancelled"}.get(state)
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE trials SET state = ?, outcome = ?, error_code = ?, error = ?, "
+                "cost_usd = ?, worker_id = NULL, reserved_usd = 0, lease_expires_at = NULL, "
+                "not_before = ? WHERE trial_id = ? AND attempt = ? AND state IN (?, ?, ?) "
+                "AND COALESCE(lease_expires_at, 0) < ?",
+                (
+                    state,
+                    outcome,
+                    WORKER_LOST,
+                    WORKER_LOST_MESSAGE,
+                    cost_usd,
+                    now,
+                    trial.trial_id,
+                    trial.attempt,
+                    *IN_FLIGHT_STATES,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute(
+                "UPDATE trial_attempts SET outcome = 'infra_error', error_code = ?, error = ?, "
+                "cost_usd = ?, judge_cost_usd = ?, ended_at = ? WHERE trial_id = ? AND attempt = ?",
+                (
+                    WORKER_LOST,
+                    WORKER_LOST_MESSAGE,
+                    cost_usd,
+                    judge_cost_usd,
+                    _now(),
+                    trial.trial_id,
+                    trial.attempt,
+                ),
+            )
+            return True
 
     def set_trial_state(self, trial: ClaimedTrial, worker_id: str, state: str) -> None:
         self._conn.execute(
@@ -401,8 +536,8 @@ class Store:
         with self._transaction() as conn:
             conn.execute(
                 "UPDATE trial_attempts SET outcome = ?, error_code = ?, error = ?, cost_usd = ?, "
-                "judge_cost_usd = ?, trajectory_uri = ?, ended_at = ? "
-                "WHERE trial_id = ? AND attempt = ?",
+                "judge_cost_usd = ?, trajectory_uri = ?, ended_at = ?, model_calls = ?, "
+                "model_latency_s = ? WHERE trial_id = ? AND attempt = ?",
                 (
                     result.outcome,
                     result.error_code,
@@ -411,6 +546,8 @@ class Store:
                     result.judge_cost_usd,
                     str(result.trajectory_path),
                     _now(),
+                    result.usage.model_calls,
+                    result.usage.model_latency_s,
                     trial.trial_id,
                     trial.attempt,
                 ),
@@ -420,7 +557,7 @@ class Store:
             if requeue_delay_s is not None:
                 cursor = conn.execute(
                     "UPDATE trials SET state = 'QUEUED', worker_id = NULL, reserved_usd = 0, "
-                    f"not_before = ?, error_code = ?, error = ? {owned}",
+                    f"lease_expires_at = NULL, not_before = ?, error_code = ?, error = ? {owned}",
                     (
                         time.time() + requeue_delay_s,
                         result.error_code,
@@ -434,8 +571,8 @@ class Store:
                 "UPDATE trials SET state = ?, outcome = ?, score = ?, termination = ?, "
                 "error_code = ?, error = ?, steps = ?, input_tokens = ?, output_tokens = ?, "
                 "cache_read_tokens = ?, cache_write_tokens = ?, cost_usd = ?, duration_s = ?, "
-                "judge_cost_usd = ?, reserved_usd = 0, trajectory_uri = ?, final_state_uri = ? "
-                f"{owned}",
+                "judge_cost_usd = ?, reserved_usd = 0, lease_expires_at = NULL, "
+                f"trajectory_uri = ?, final_state_uri = ? {owned}",
                 (
                     _final_state(result),
                     result.outcome,
@@ -651,6 +788,117 @@ class Store:
             for row in rows
         ]
 
+    # CI baselines (WF-10) ---------------------------------------------------------------------
+
+    def current_suite_version(self, suite_id: str, task_refs: list[tuple[str, int]]) -> int | None:
+        """The suite version with exactly these task versions, if it is the latest one."""
+        latest = self._conn.execute(
+            "SELECT version, task_refs FROM suites WHERE suite_id = ? "
+            "ORDER BY version DESC LIMIT 1",
+            (suite_id,),
+        ).fetchone()
+        if latest and latest["task_refs"] == json.dumps(sorted(task_refs)):
+            return latest["version"]
+        return None
+
+    def find_baseline(
+        self, suite_id: str, suite_version: int, branch: str, finished_after: datetime
+    ) -> str | None:
+        """The newest completed run of this suite version labelled with `branch` that finished
+        after the cutoff and ran every planned trial (not BUDGET_TRUNCATED)."""
+        rows = self._conn.execute(
+            "SELECT run_id, labels, flags FROM runs WHERE suite_id = ? AND suite_version = ? "
+            "AND status = 'completed' AND finished_at > ? ORDER BY finished_at DESC",
+            (suite_id, suite_version, finished_after.isoformat(timespec="seconds")),
+        )
+        for row in rows:
+            if json.loads(row["labels"]).get("branch") != branch:
+                continue
+            if "BUDGET_TRUNCATED" not in json.loads(row["flags"]):
+                return row["run_id"]
+        return None
+
+    # Garbage collection -------------------------------------------------------------------
+
+    def runs_finished_before(self, cutoff: datetime) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            f"{RUN_LISTING} WHERE runs.status IN ('completed', 'cancelled', 'failed') "
+            "AND runs.finished_at < ? ORDER BY runs.finished_at",
+            (cutoff.isoformat(timespec="seconds"),),
+        )
+        return [_run_dict(row) for row in rows]
+
+    def pending_reviews_for_run(self, run_id: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM reviews r JOIN trials t USING (trial_id) "
+            "WHERE t.run_id = ? AND r.reviewed_at IS NULL",
+            (run_id,),
+        ).fetchone()[0]
+
+    def live_trial_ids(self, now: float | None = None) -> set[str]:
+        """Trials in flight whose lease is still held: their sandboxes are in use."""
+        rows = self._conn.execute(
+            "SELECT trial_id FROM trials WHERE state IN (?, ?, ?) AND lease_expires_at >= ?",
+            (*IN_FLIGHT_STATES, time.time() if now is None else now),
+        )
+        return {row["trial_id"] for row in rows}
+
+    # Metrics (NFR-OBS-02) -----------------------------------------------------------------
+
+    def metrics(self, duration_buckets: tuple[float, ...]) -> dict[str, Any]:
+        """Totals across every run, for the Prometheus endpoint."""
+        conn = self._conn
+        bucket_sums = ", ".join(f"SUM(duration_s <= {float(le)!r})" for le in duration_buckets)
+        durations = conn.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(duration_s), 0), {bucket_sums} FROM trials "
+            "WHERE state IN ('COMPLETED', 'INFRA_ERROR', 'CANCELLED') AND duration_s IS NOT NULL"
+        ).fetchone()
+        attempts = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(judge_cost_usd), 0), "
+            "COALESCE(SUM(model_calls), 0), COALESCE(SUM(model_latency_s), 0) FROM trial_attempts"
+        ).fetchone()
+        return {
+            "trial_states": dict(conn.execute("SELECT state, COUNT(*) FROM trials GROUP BY state")),
+            "trial_outcomes": dict(
+                conn.execute(
+                    "SELECT outcome, COUNT(*) FROM trials WHERE outcome IS NOT NULL "
+                    "GROUP BY outcome"
+                )
+            ),
+            "attempt_outcomes": dict(
+                conn.execute(
+                    "SELECT outcome, COUNT(*) FROM trial_attempts WHERE outcome IS NOT NULL "
+                    "GROUP BY outcome"
+                )
+            ),
+            "infra_errors": dict(
+                conn.execute(
+                    "SELECT error_code, COUNT(*) FROM trial_attempts "
+                    "WHERE outcome = 'infra_error' GROUP BY error_code"
+                )
+            ),
+            "run_statuses": dict(conn.execute("SELECT status, COUNT(*) FROM runs GROUP BY status")),
+            "durations": {
+                "count": durations[0],
+                "sum": durations[1],
+                "buckets": [count or 0 for count in durations[2:]],
+            },
+            "agent_spend_usd": attempts[0],
+            "judge_spend_usd": attempts[1],
+            "model_calls": attempts[2],
+            "model_latency_s": attempts[3],
+        }
+
+    def run_task_versions(self, run_id: str) -> list[TaskVersion]:
+        """The task versions a run pinned, so it can be resumed exactly as it started."""
+        rows = self._conn.execute(
+            "SELECT v.* FROM task_versions v WHERE EXISTS (SELECT 1 FROM trials t "
+            "WHERE t.run_id = ? AND t.task_id = v.task_id AND t.task_version = v.version) "
+            "ORDER BY v.task_id",
+            (run_id,),
+        )
+        return [_task_version(row) for row in rows]
+
     def task_specs_for_run(self, run_id: str) -> dict[str, dict[str, Any]]:
         """The pinned task spec of every task in a run, by task id."""
         rows = self._conn.execute(
@@ -750,7 +998,21 @@ def _task_version(row: sqlite3.Row) -> TaskVersion:
 
 
 def _final_state(result: AttemptResult) -> str:
-    return "INFRA_ERROR" if result.outcome == "infra_error" else "COMPLETED"
+    return {"infra_error": "INFRA_ERROR", "cancelled": "CANCELLED"}.get(result.outcome, "COMPLETED")
+
+
+def _cancel_queued(conn: sqlite3.Connection, run_id: str) -> None:
+    conn.execute(
+        "UPDATE trials SET state = 'CANCELLED', outcome = 'cancelled', reserved_usd = 0 "
+        "WHERE run_id = ? AND state = 'QUEUED'",
+        (run_id,),
+    )
+
+
+def _claimed(row: sqlite3.Row) -> ClaimedTrial:
+    return ClaimedTrial(
+        row["trial_id"], row["task_id"], row["task_version"], row["trial_index"], row["attempt"]
+    )
 
 
 def _usage_columns(result: AttemptResult) -> tuple[Any, ...]:

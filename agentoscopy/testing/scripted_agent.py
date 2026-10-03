@@ -7,6 +7,8 @@ The well-behaved, broken, and malicious test agents are all configs for this one
 
 from __future__ import annotations
 
+import asyncio
+
 from anthropic import AsyncAnthropic, BadRequestError
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,6 +42,12 @@ class ReadAction(_Model):
     read: str
 
 
+class SleepAction(_Model):
+    """Keeps the trial in flight, e.g. so tests can cancel or crash a run mid-trial."""
+
+    sleep: float = Field(ge=0)
+
+
 class ModelCallsAction(_Model):
     model_calls: int = Field(gt=0)
     prompt: str = "Continue with the task."
@@ -47,7 +55,7 @@ class ModelCallsAction(_Model):
     stream: bool = False
 
 
-Action = ExecAction | WriteAction | ReadAction | ModelCallsAction
+Action = ExecAction | WriteAction | ReadAction | ModelCallsAction | SleepAction
 
 
 class ScriptParams(_Model):
@@ -78,7 +86,9 @@ class ScriptedAgent:
         client = AsyncAnthropic(base_url=model_endpoint.base_url, api_key=model_endpoint.token)
         try:
             for action in self._params.script:
-                if isinstance(action, ModelCallsAction):
+                if isinstance(action, SleepAction):
+                    await asyncio.sleep(action.sleep)
+                elif isinstance(action, ModelCallsAction):
                     if not await _call_model(client, self._params.model, action):
                         break  # budget spent: stop, as a real agent would
                 else:

@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
-from agentoscopy.sandbox.base import HIDDEN_MOUNT, ExecResult, SandboxError
+from agentoscopy.sandbox.base import HIDDEN_MOUNT, ExecResult, SandboxError, SandboxRecord
 from agentoscopy.spec import Task
 
 AGENT_USER = "1000:1000"  # non-root (FR-SBX-04); the task image chowns the workdir to it
 PIDS_LIMIT = 512
 TRIAL_LABEL = "agentoscopy.trial_id"
+INSPECT_FORMAT = '{{.Id}} {{index .Config.Labels "' + TRIAL_LABEL + '"}} {{.Created}}'
 KILL_GRACE_S = 5  # time between SIGTERM and SIGKILL when an exec times out
 FILE_OP_TIMEOUT_S = 60
 TIMEOUT_EXIT_CODES = (124, 137)  # coreutils `timeout`: SIGTERM worked / SIGKILL was needed
@@ -44,6 +47,42 @@ class DockerBackend:
             await run_docker("image", "rm", "--force", snapshot)
             raise
         return DockerSandbox(container, task.spec.environment.workdir, owned_image=snapshot)
+
+    async def remove_trial_sandboxes(self, trial_id: str) -> None:
+        label = f"label={TRIAL_LABEL}={trial_id}"
+        containers = (await _docker_checked("ps", "--all", "--quiet", "--filter", label)).split()
+        if containers:
+            await _docker_checked("rm", "--force", "--volumes", *containers)
+        images = sorted(
+            set((await _docker_checked("images", "--quiet", "--filter", label)).split())
+        )
+        if images:
+            await _docker_checked("image", "rm", "--force", *images)
+
+    async def list_sandboxes(self) -> list[SandboxRecord]:
+        label = f"label={TRIAL_LABEL}"
+        found = {
+            "container": await _docker_checked("ps", "--all", "--quiet", "--filter", label),
+            "image": await _docker_checked("images", "--quiet", "--filter", label),
+        }
+        records = []
+        for kind, listing in found.items():
+            refs = sorted(set(listing.split()))
+            if not refs:
+                continue
+            inspected = await _docker_checked(
+                "inspect", "--type", kind, "--format", INSPECT_FORMAT, *refs
+            )
+            for line in inspected.splitlines():
+                ref, trial_id, created = line.split(" ", 2)
+                records.append(SandboxRecord(kind, ref, trial_id, _docker_time(created)))
+        return records
+
+    async def remove_sandbox(self, record: SandboxRecord) -> None:
+        if record.kind == "container":
+            await _docker_checked("rm", "--force", "--volumes", record.ref)
+        else:
+            await _docker_checked("image", "rm", "--force", record.ref)
 
 
 class DockerSandbox:
@@ -227,6 +266,12 @@ def _write_build_context(context: Path, task: Task) -> None:
         target = context / "fixtures" / file.relative_to(task.fixtures_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(file, target)
+
+
+def _docker_time(text: str) -> datetime:
+    """Docker prints RFC 3339 times with nanoseconds, more digits than datetime accepts."""
+    trimmed = re.sub(r"(\.\d{6})\d+", r"\1", text.strip()).replace("Z", "+00:00")
+    return datetime.fromisoformat(trimmed)
 
 
 def _text(data: bytes) -> str:

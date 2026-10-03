@@ -262,9 +262,8 @@ function runName(run) {
 
 function statusText(run) {
   const flags = run.flags?.length ? `, ${run.flags.join(", ").toLowerCase().replaceAll("_", " ")}` : "";
-  if (run.status === "running" || run.status === "pending") {
-    return `${run.status === "running" ? "Running" : "Pending"}, ${run.finished_trials} of ${run.total_trials}`;
-  }
+  const active = { running: "Running", pending: "Pending", cancelling: "Cancelling" }[run.status];
+  if (active) return `${active}, ${run.finished_trials} of ${run.total_trials}`;
   return `${run.status[0].toUpperCase()}${run.status.slice(1)}${flags}`;
 }
 
@@ -377,6 +376,7 @@ async function runView(runId) {
       `${runName(run)} with ${run.config_name}, ${plural(run.trials_per_task, "trial")} per task, seed ${run.seed}. `,
       `Started ${when(run.created_at)}. ${statusText(run)}.`,
     ),
+    cancelControl(run),
     h(
       "div",
       { class: "headline" },
@@ -408,6 +408,32 @@ async function runView(runId) {
     table(["Task", "Trials", "Pass rate", "Passes", `pass@${k}`, `pass^${k}`, "Cost per trial", "Steps"], taskRows, [3, 4, 5, 6, 7]),
     sliceSections(summary.slices, "Mean pass rate", (value) => h("span", { class: "bar-cell" }, magnitude(value), pct(value))),
   ];
+}
+
+function cancelControl(run) {
+  if (run.status !== "running" && run.status !== "pending") return null;
+  const button = h("button", { type: "button" }, "Cancel run");
+  const note = h("span", { class: "muted", role: "status" });
+  let armed = false;
+  button.addEventListener("click", async () => {
+    if (!armed) {
+      // A second click confirms, so a stray click never stops a run.
+      armed = true;
+      button.textContent = "Confirm: cancel run";
+      button.classList.add("danger");
+      note.textContent = "Queued trials stop at once; running ones within a few seconds. Finished trials keep their results.";
+      return;
+    }
+    button.disabled = true;
+    try {
+      const result = await api(`/runs/${enc(run.run_id)}`, { method: "DELETE" });
+      note.textContent = result.status === "cancelled" ? "Cancelled." : "Cancelling.";
+    } catch (error) {
+      note.textContent = sentence(error.message);
+      button.disabled = false;
+    }
+  });
+  return h("div", { class: "toolbar" }, button, note);
 }
 
 function costNote(summary) {

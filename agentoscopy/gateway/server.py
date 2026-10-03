@@ -299,7 +299,8 @@ def _record_response(
     usage = message.get("usage") or {}
     # A refusal fallback can serve the turn with another model; bill the model that answered.
     price = price_for(str(message.get("model", ""))) or request_price
-    call_cost = session.add_usage(price, usage)
+    latency_s = time.monotonic() - started
+    call_cost = session.add_usage(price, usage, latency_s)
     session.recorder.write(
         "model_response",
         {
@@ -312,7 +313,7 @@ def _record_response(
             "cache_read_tokens": usage.get("cache_read_input_tokens"),
             "cache_write_tokens": usage.get("cache_creation_input_tokens"),
             "cost_usd": round(call_cost, 8),
-            "latency_ms": round((time.monotonic() - started) * 1000),
+            "latency_ms": round(latency_s * 1000),
             "backoff_ms": round(backoff_s * 1000),
         },
     )

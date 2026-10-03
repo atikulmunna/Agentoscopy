@@ -110,8 +110,17 @@ def action_lines(events: list[dict[str, Any]], limit: int = 80) -> list[str]:
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as file:
-        return [json.loads(line) for line in file if line.strip()]
+    """The recorded events. A process killed mid-write can leave the last line cut off; that
+    line is skipped, while damage anywhere else still raises."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    events = [json.loads(line) for line in lines[:-1]]
+    if lines:
+        try:
+            events.append(json.loads(lines[-1]))
+        except json.JSONDecodeError:
+            pass  # the cut-off final write
+    return events
 
 
 def _truncate(data: bytes) -> str:

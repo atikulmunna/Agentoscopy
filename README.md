@@ -1,11 +1,12 @@
 # Agentoscopy
 
-An evaluation harness for LLM agents. This is milestone M3: suites of tasks run as
+An evaluation harness for LLM agents. This is milestone M4: suites of tasks run as
 concurrent trials in Docker sandboxes, every model call goes through a budget-enforcing
 gateway, results land in SQLite, and runs can be compared statistically, from the CLI
 or in a local web UI. Trials are graded by commands, trajectory rules, a tamper check
 that vetoes reward hacking, and an LLM judge whose agreement with human reviewers is
-measured.
+measured. Runs survive crashes and can be cancelled, and `agentoscopy ci` gates pull
+requests on regressions.
 
 ## Setup
 
@@ -23,6 +24,9 @@ uv run agentoscopy task list                            # validation status of e
 uv run agentoscopy run --suite example --agent configs/scripted-fix.yaml --trials 3
 uv run agentoscopy report <run_id> --format md          # table, md, or json
 uv run agentoscopy compare <baseline_run> <candidate_run>
+uv run agentoscopy run --resume <run_id>                # continue a run after a crash
+uv run agentoscopy cancel <run_id>
+uv run agentoscopy gc --older-than 30d                  # old run outputs, orphaned sandboxes
 uv run agentoscopy serve                                # web UI; open the URL it prints
 ```
 
@@ -37,7 +41,41 @@ to both `task validate` and `run`. The mock judge answers at random, so expect t
 calibration page to call it uncalibrated.
 
 Exit codes: `0` success, `1` a task failed a validation check, `2` invalid input, `3`
-environment or harness failure.
+environment or harness failure, `130` the run was cancelled.
+
+## Crashes, resuming, and cancelling
+
+A trial in flight is held under a lease that its process renews every 10 seconds. If the
+process dies, the lease runs out after 30 seconds, and `agentoscopy run --resume <run_id>`
+picks the run up: it removes the containers and snapshots the dead attempts left behind,
+counts what those attempts spent, and runs the trials again. A trial is finalised only by
+the process that holds it, so nothing is lost or counted twice. Resuming needs the tasks
+to have the content the run started with.
+
+`agentoscopy cancel <run_id>` (or the run page's Cancel button) cancels queued trials at
+once. Trials that are setting up or running stop within a few seconds, with 30 seconds
+for the agent to wind down; trials already being graded finish. Finished trials keep
+their results, and the run gets a partial summary. Ctrl-C in `agentoscopy run` is
+blunter: it cancels every unfinished trial at once, including any being graded.
+
+`agentoscopy gc` deletes the trajectories and artifacts of runs that finished more than
+`--older-than` ago (results stay in the database; runs with trials waiting for review
+are kept), and removes sandboxes that no running trial holds. `--dry-run` only reports.
+
+## CI gating
+
+`agentoscopy ci --suite S --agent C --baseline main` runs the suite, compares it with the
+newest completed run of the same suite version labelled `branch=main` (from the last 7
+days, `--max-baseline-age`), and reports the verdict. With no such run it runs one first
+with `--baseline-agent`. `--github` posts the comparison as a pull request comment and
+updates that same comment on later pushes; inside GitHub Actions it needs only
+`GITHUB_TOKEN`. `--override` (the workflow sets it for the `eval-override` label) reports a
+regression without failing. Exit codes: `0` no regression, `1` regression, `2` harness
+error, `3` the candidate run hit its budget.
+
+`.github/workflows/eval.yml` wires this up: pull requests are evaluated against the
+baseline that pushes to `main` keep fresh in the Actions cache, and pull requests from
+forks never run with provider credentials.
 
 ## Comparing runs
 
@@ -104,6 +142,14 @@ timeline, graders, and filesystem diff, the comparison, side-by-side trajectorie
 review queue, and judge calibration. Every API call needs the token in the printed URL,
 and requests for other host names are refused. Runs started from the CLI appear live.
 
+Runs can be started and cancelled over HTTP. `POST /runs` takes JSON with `agent` (the name
+of a config in `--configs-dir`, default `configs/`), either `suite` or `tasks`, and
+optionally `trials`, `budget_usd`, `concurrency`, `seed`, `labels`, `judge_model`, and
+`review_rate`; the run executes in the server process. `DELETE /runs/{run_id}` cancels
+one. `GET /metrics` serves Prometheus metrics for every run in the database: queue depth,
+trials in flight, outcomes, infra errors, trial durations, gateway latency, and spend.
+Set `AGENTOSCOPY_API_TOKEN` to give the server a fixed token, for example for a scraper.
+
 Review endpoints: `GET /review/queue?limit=N`; `POST /review/queue` with `trial_id` and an
 optional `grader_name`, to add an item by hand; `POST /review/{review_id}` with `passed`
 and optional `score`, `note`, `reviewer`, and `override`, which answers with the judge's
@@ -145,6 +191,7 @@ trajectories, and artifacts are written under `.agentoscopy/`.
 
 ```sh
 uv run pytest                    # integration tests are skipped if Docker is not running
+uv run pytest tests/chaos        # kills a run mid-flight and resumes it
 uv run pytest -m "not integration"
 uv run ruff check . && uv run ruff format --check agentoscopy tests
 ```

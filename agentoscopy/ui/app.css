@@ -115,6 +115,7 @@ button, select, input[type="search"], input[type="number"], textarea {
 button { cursor: pointer; }
 button:disabled { color: var(--muted); cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); font-weight: 600; }
+button.danger { border-color: var(--critical); color: var(--critical-text); font-weight: 600; }
 button.primary:disabled { background: var(--surface-sunk); border-color: var(--hairline); color: var(--muted); }
 
 main {

@@ -27,6 +27,8 @@ class Usage:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     cost_usd: float = 0.0
+    model_calls: int = 0  # answered calls, for gateway latency (NFR-OBS-02)
+    model_latency_s: float = 0.0
 
 
 @dataclass
@@ -78,7 +80,7 @@ class TrialSession:
         self.recorder.step = self.usage.steps
         return self.usage.steps
 
-    def add_usage(self, price: Price, usage: dict[str, Any]) -> float:
+    def add_usage(self, price: Price, usage: dict[str, Any], latency_s: float = 0.0) -> float:
         call_cost = cost_usd(price, usage)
         current = self.usage
         self.usage = replace(
@@ -90,5 +92,7 @@ class TrialSession:
             cache_write_tokens=current.cache_write_tokens
             + int(usage.get("cache_creation_input_tokens") or 0),
             cost_usd=current.cost_usd + call_cost,
+            model_calls=current.model_calls + 1,
+            model_latency_s=current.model_latency_s + latency_s,
         )
         return call_cost

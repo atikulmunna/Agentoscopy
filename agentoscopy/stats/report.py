@@ -118,6 +118,26 @@ def render_comparison(comparison: dict[str, Any], output_format: str) -> str:
     return "\n".join([*lines, "", *table])
 
 
+def render_ci_comment(comparison: dict[str, Any], *, overridden: bool, truncated: bool) -> str:
+    """The pull request comment for `agentoscopy ci` (WF-10 step 4), in Markdown."""
+    verdict = comparison["verdict"].replace("_", " ").capitalize()
+    lines = [f"## Agentoscopy: {verdict}", ""]
+    if overridden:
+        lines += [
+            "> The `eval-override` label is set, so this regression does not fail the check.",
+            "",
+        ]
+    if truncated:
+        lines += [
+            "> The candidate run hit its budget and skipped trials, so these results are "
+            "incomplete.",
+            "",
+        ]
+    # The Markdown comparison minus its own title, which repeats the verdict.
+    lines.append(render_comparison(comparison, "md").split("\n", 2)[2])
+    return "\n".join(lines) + "\n"
+
+
 def _comparison_headline(comparison: dict[str, Any]) -> list[str]:
     base, cand = comparison["baseline"], comparison["candidate"]
     low, high = comparison["delta_ci_95"]

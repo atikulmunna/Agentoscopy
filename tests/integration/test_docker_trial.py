@@ -2,9 +2,12 @@
 
 import asyncio
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
+import yaml
 from conftest import running_gateway
 
 from agentoscopy.adapters.python import load_python_adapter
@@ -177,3 +180,63 @@ def test_cli_validates_then_runs_the_example_suite(tmp_path, capsys):
     assert compared.startswith("REGRESSION")
     # 2 of 2 to 0 of 2 is a real drop, but too few trials for the per-task test to call it.
     assert f"{TASK_ID}  changed" in compared
+
+
+def test_a_killed_run_is_resumed_and_its_orphaned_sandboxes_removed(tmp_path):
+    """Acceptance criterion 4 on Docker: kill `agentoscopy run` mid-trial, then resume it."""
+    home, common = (
+        tmp_path / "home",
+        ["--tasks-dir", str(REPO / "tasks"), "--suites-dir", str(REPO / "suites")],
+    )
+    fix = yaml.safe_load((REPO / "configs" / "scripted-fix.yaml").read_text())
+    fix["params"]["script"].insert(0, {"sleep": 6})  # keep trials in flight long enough to crash
+    agent = tmp_path / "slow-fix.yaml"
+    agent.write_text(yaml.safe_dump(fix))
+    judged = ["--home", str(home), *common, "--judge-model", "mock"]
+    assert main(["task", "validate", TASK_ID, *judged]) == 0
+    process = subprocess.Popen(
+        [
+            sys.executable, "-c", "from agentoscopy.cli.main import main; raise SystemExit(main())",
+            "run", "--task", TASK_ID, "--agent", str(agent), "--trials", "4", "--concurrency", "2",
+            *judged,
+        ],
+        stdout=subprocess.DEVNULL,
+    )  # fmt: skip
+    store = Store(home / "agentoscopy.db")
+    try:
+        run_id = wait_for_crash_point(store, process)
+        process.kill()
+        process.wait()
+        orphans = [r["trial_id"] for r in store.trial_rows(run_id) if r["state"] == "RUNNING"]
+        assert orphans and all(leftovers("ps", trial_id) for trial_id in orphans)
+
+        assert main(["run", "--resume", run_id, "--home", str(home), *common]) == 0
+
+        rows = store.trial_rows(run_id)
+        assert [row["state"] for row in rows] == ["COMPLETED"] * 4
+        assert {row["outcome"] for row in rows} == {"pass"}
+        for trial_id in orphans:
+            first, second = store.get_trial(trial_id)["attempts"]
+            assert (first["error_code"], second["outcome"]) == ("WORKER_LOST", "pass")
+        for row in rows:  # nothing left behind, by the crash or by the resumed run
+            assert leftovers("ps", row["trial_id"]) == ""
+            assert leftovers("images", row["trial_id"]) == ""
+    finally:
+        if process.poll() is None:
+            process.kill()
+        store.close()
+
+
+def wait_for_crash_point(store, process):
+    """The run's id, once a trial has finished and another's agent is running."""
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        assert process.poll() is None, "the run ended before it could be killed"
+        runs = store.list_runs()
+        if runs:
+            run_id = runs[0]["run_id"]
+            states = [row["state"] for row in store.trial_rows(run_id)]
+            if states.count("COMPLETED") >= 1 and "RUNNING" in states:
+                return run_id
+        time.sleep(0.2)
+    raise AssertionError("the run never reached a point worth crashing at")
