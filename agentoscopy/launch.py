@@ -9,15 +9,18 @@ from pathlib import Path
 
 from agentoscopy.adapters.python import AdapterLoadError, load_python_adapter
 from agentoscopy.gateway.server import Gateway
+from agentoscopy.replay import RecordedCall, load_recording
 from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.base import SandboxBackend
 from agentoscopy.scheduler.plan import (
     PinnedTask,
     PlanError,
+    TaskFilter,
     check_budget,
     check_judge,
     pin_tasks,
     plan_trials,
+    select_tasks,
 )
 from agentoscopy.scheduler.runner import REVIEW_RATE, ProgressCallback, RunExecutor
 from agentoscopy.spec import (
@@ -27,7 +30,8 @@ from agentoscopy.spec import (
     load_suite,
     load_task,
 )
-from agentoscopy.storage.store import RunSettings, Store, TaskVersion
+from agentoscopy.storage.store import NewTrial, RunSettings, Store, TaskVersion
+from agentoscopy.worker.trial import attempt_paths
 
 DEFAULT_JUDGE_MODEL = "claude-opus-5-5"
 DEFAULT_CONCURRENCY = 4
@@ -57,6 +61,7 @@ class RunRequest:
     labels: dict[str, str] = field(default_factory=dict)
     judge_model: str = DEFAULT_JUDGE_MODEL
     review_rate: float = REVIEW_RATE
+    task_filter: TaskFilter = field(default_factory=TaskFilter)
 
 
 @dataclass(frozen=True)
@@ -65,14 +70,20 @@ class PreparedRun:
     pinned: list[PinnedTask]
     config: AgentConfig
     settings: RunSettings
+    replay: tuple[RecordedCall, ...] | None = None  # for a replay run
 
 
 def create_run(
     store: Store, dirs: Directories, request: RunRequest, *, has_credentials: bool
 ) -> PreparedRun:
-    """Pin the tasks, check the plan, and record the run with its queued trials."""
+    """Pin the tasks, check the plan, and record the run with its queued trials.
+
+    A filtered suite run records no suite version: it did not run the whole suite, so it
+    must never stand in for one (a CI baseline, say). The filter becomes a label."""
     try:
         task_ids = load_suite(dirs.suites, request.suite).tasks if request.suite else request.tasks
+        if request.task_filter:
+            task_ids = select_tasks(store, dirs.tasks, list(task_ids), request.task_filter)
         pinned = pin_tasks(store, dirs.tasks, list(task_ids))
         check_budget(pinned, request.budget_usd)
         tasks = [item.task for item in pinned]
@@ -82,7 +93,10 @@ def create_run(
     except (SpecError, PlanError, AdapterLoadError) as exc:
         raise LaunchError(str(exc)) from exc
     suite_version = None
-    if request.suite:
+    labels = dict(request.labels)
+    if request.task_filter:
+        labels["filter"] = request.task_filter.describe()
+    elif request.suite:
         refs = [(item.task.spec.id, item.version) for item in pinned]
         suite_version = store.save_suite_version(request.suite, refs)
     settings = RunSettings(
@@ -93,7 +107,7 @@ def create_run(
         seed=request.seed if request.seed is not None else secrets.randbelow(2**31),
         concurrency=request.concurrency,
         harness_version=version("agentoscopy"),
-        labels=dict(request.labels),
+        labels=labels,
         judge_model=judge_model,
         review_rate=request.review_rate,
     )
@@ -116,6 +130,8 @@ def resume_run(
         raise LaunchError(f"NOT_FOUND: no run {run_id}")
     if run["status"] not in RESUMABLE:
         raise LaunchError(f"RUN_FINISHED: run {run_id} is already {run['status']}")
+    if run["mode"] == "replay":
+        raise LaunchError("REPLAY_NOT_RESUMABLE: replay the source trial again instead")
     try:
         pinned = [_repin(dirs.tasks, version) for version in store.run_task_versions(run_id)]
         config = AgentConfig.model_validate(store.config_spec(run["config_hash"]))
@@ -162,12 +178,60 @@ async def execute_run(
         on_progress=on_progress,
         judge_model=settings.judge_model,
         review_rate=REVIEW_RATE if settings.review_rate is None else settings.review_rate,
+        replay=prepared.replay,
     )
     try:
         await executor.execute()
     finally:
         store.save_summary(prepared.run_id, run_summary(store, prepared.run_id, refresh=True))
     return store.run_status(prepared.run_id) or "unknown"
+
+
+def create_replay(
+    store: Store, dirs: Directories, trial_id: str, *, has_credentials: bool
+) -> PreparedRun:
+    """A one-trial run that reruns a recorded trial (WF-11): same task version, config,
+    and seed, with model calls answered from the trial's final attempt."""
+    trial = store.get_trial(trial_id)
+    if trial is None:
+        raise LaunchError(f"NOT_FOUND: no trial {trial_id}")
+    source = store.get_run(trial["run_id"])
+    trajectory, artifacts = attempt_paths(dirs.home, source["run_id"], trial_id, trial["attempt"])
+    recording = load_recording(trajectory, artifacts) if trajectory.is_file() else []
+    if not recording:
+        raise LaunchError(f"NO_RECORDING: trial {trial_id} has no recorded model calls")
+    versions = {v.task_id: v for v in store.run_task_versions(source["run_id"])}
+    try:
+        pinned = _repin(dirs.tasks, versions[trial["task_id"]])
+        config = AgentConfig.model_validate(store.config_spec(source["config_hash"]))
+        load_python_adapter(config.entrypoint)
+        if source["judge_model"]:
+            check_judge([pinned.task], source["judge_model"], has_credentials)
+    except (SpecError, PlanError, AdapterLoadError) as exc:
+        raise LaunchError(str(exc)) from exc
+    settings = RunSettings(
+        suite_id=None,
+        suite_version=None,
+        trials_per_task=1,
+        budget_usd=None,  # replayed calls cost nothing
+        seed=source["seed"],
+        concurrency=1,
+        harness_version=version("agentoscopy"),
+        labels={"replay_of": trial_id},
+        judge_model=source["judge_model"],
+        review_rate=0.0,
+        mode="replay",
+    )
+    new_trial = NewTrial(
+        trial["task_id"],
+        trial["task_version"],
+        trial["trial_index"],  # the same seed key, so a mock judge answers the same
+        0,
+        pinned.task.spec.budget.max_cost_usd,
+        source_trial_id=trial_id,
+    )
+    run_id = store.create_run(config, settings, [new_trial])
+    return PreparedRun(run_id, [pinned], config, settings, tuple(recording))
 
 
 def _repin(tasks_dir: Path, pinned_version: TaskVersion) -> PinnedTask:

@@ -1,0 +1,23 @@
+# Twenty small Python bug fixes and features: the default suite for comparing agents.
+name: core
+tasks:
+  - add-deep-merge
+  - add-lru-cache
+  - add-merge-intervals
+  - add-moving-average
+  - add-retry-decorator
+  - add-version-compare
+  - fix-binary-search-edges
+  - fix-chunk-remainder
+  - fix-clamp-upper-bound
+  - fix-csv-quoted-fields
+  - fix-date-range-inclusive
+  - fix-dedupe-keeps-order
+  - fix-fahrenheit-to-celsius
+  - fix-leap-year
+  - fix-median-even-length
+  - fix-off-by-one-pagination
+  - fix-parse-duration-minutes
+  - fix-roman-subtractive
+  - fix-slugify-separators
+  - fix-word-count-whitespace

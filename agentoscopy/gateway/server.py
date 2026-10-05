@@ -25,6 +25,7 @@ from agentoscopy.gateway.pricing import Price, is_mock, price_for
 from agentoscopy.gateway.session import BudgetExhausted, TrialSession
 from agentoscopy.gateway.sse import MessageAccumulator
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
+from agentoscopy.replay import REPLAY_DIVERGED_ERROR, RecordedCall, request_hash
 from agentoscopy.spec import Budget
 
 UPSTREAM_ATTEMPTS = 4
@@ -33,6 +34,7 @@ BACKOFF_CAP_S = 30.0
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
 PROVIDER_FAILURE_TYPES = frozenset({"api_error", "overloaded_error"})
 FORWARDED_HEADERS = ("anthropic-version", "anthropic-beta")
+FREE = Price(input=0.0, output=0.0, cache_read=0.0)  # replayed calls cost nothing
 RECORDED_PARAMS = (
     "max_tokens",
     "stream",
@@ -82,11 +84,18 @@ class Gateway:
             await self._runner.cleanup()
 
     def open_session(
-        self, trial_id: str, budget: Budget, recorder: TrajectoryRecorder, seed_key: str
+        self,
+        trial_id: str,
+        budget: Budget,
+        recorder: TrajectoryRecorder,
+        seed_key: str,
+        replay: list[RecordedCall] | None = None,
     ) -> TrialSession:
+        """A trial's session. With `replay`, model calls are answered from that recording."""
         token = "agt-" + secrets.token_urlsafe(32)
         recorder.add_secret(token)
         session = TrialSession(trial_id, token, self.base_url, budget, recorder, seed_key)
+        session.replay = replay
         self._sessions[token] = session
         return session
 
@@ -125,6 +134,8 @@ class Gateway:
             return _error(400, BUDGET_EXCEEDED_ERROR, f"Agentoscopy trial budget: {exc}")
         call_index = session.start_call()
         _record_request(session, call_index, body, requested)
+        if session.replay is not None:
+            return await _serve_replay(request, session, call_index, body, requested)
         if is_mock(body["model"]):
             return await self._serve_mock(request, session, call_index, body, price)
         return await self._serve_upstream(request, session, call_index, body, price)
@@ -260,6 +271,44 @@ async def _relay_error(
     return web.Response(status=upstream.status, body=data, content_type="application/json")
 
 
+async def _serve_replay(
+    request: web.Request,
+    session: TrialSession,
+    call_index: int,
+    body: dict[str, Any],
+    requested_max_tokens: int,
+) -> web.StreamResponse:
+    """Answer from the recording, if the agent sent the request that was recorded."""
+    recording = session.replay or []
+    recorded = recording[call_index - 1] if call_index <= len(recording) else None
+    sent = {**body, "max_tokens": requested_max_tokens}
+    if recorded is None or recorded.request_hash != request_hash(sent):
+        why = (
+            "the source trial made no model call at this step"
+            if recorded is None
+            else "the request differs from the one recorded at this step"
+        )
+        session.replay_divergence = f"step {call_index}: {why}"
+        message = f"REPLAY_DIVERGED at {session.replay_divergence}"
+        session.recorder.write("error", {"source": "gateway", "message": message})
+        return _error(400, REPLAY_DIVERGED_ERROR, f"Agentoscopy replay: {message}")
+    if recorded.status != 200:
+        payload = {"call_index": call_index, "status": recorded.status, "error": recorded.response}
+        session.recorder.write("model_response", payload)
+        return web.Response(
+            status=recorded.status, text=recorded.response, content_type="application/json"
+        )
+    message = recorded.response
+    _record_response(session, call_index, message, FREE, time.monotonic(), 0.0, replayed=True)
+    if not body.get("stream"):
+        return web.json_response(message)
+    response = await _start_event_stream(request)
+    for event in sse_events(message):
+        await response.write(event)
+    await response.write_eof()
+    return response
+
+
 async def _start_event_stream(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(
         headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
@@ -295,10 +344,12 @@ def _record_response(
     request_price: Price,
     started: float,
     backoff_s: float,
+    replayed: bool = False,
 ) -> None:
     usage = message.get("usage") or {}
     # A refusal fallback can serve the turn with another model; bill the model that answered.
-    price = price_for(str(message.get("model", ""))) or request_price
+    # A replayed answer was paid for when it was recorded.
+    price = FREE if replayed else price_for(str(message.get("model", ""))) or request_price
     latency_s = time.monotonic() - started
     call_cost = session.add_usage(price, usage, latency_s)
     session.recorder.write(
@@ -315,6 +366,7 @@ def _record_response(
             "cost_usd": round(call_cost, 8),
             "latency_ms": round(latency_s * 1000),
             "backoff_ms": round(backoff_s * 1000),
+            **({"replayed": True} if replayed else {}),
         },
     )
 

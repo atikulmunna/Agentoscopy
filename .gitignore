@@ -13,3 +13,6 @@ __pycache__/
 
 # Run output (trajectories, artifacts, results)
 .agentoscopy/
+
+# Windows folder settings
+desktop.ini

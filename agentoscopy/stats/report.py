@@ -17,7 +17,7 @@ def render(summary: dict[str, Any], run: dict[str, Any], output_format: str) -> 
 
 
 def _headline(summary: dict[str, Any], run: dict[str, Any]) -> list[str]:
-    suite = f"{run['suite_id']} v{run['suite_version']}" if run.get("suite_id") else "ad hoc tasks"
+    suite = suite_name(run)
     macro = _pct(summary["macro_pass_rate"])
     ci = summary.get("macro_ci_95")
     ci_text = f" (95% CI {_pct(ci[0])} to {_pct(ci[1])})" if ci else ""
@@ -44,6 +44,14 @@ def _headline(summary: dict[str, Any], run: dict[str, Any]) -> list[str]:
     if summary["unscored_tasks"]:
         lines.append(f"unscored (no valid trials): {', '.join(summary['unscored_tasks'])}")
     return lines
+
+
+def suite_name(run: dict[str, Any]) -> str:
+    if not run.get("suite_id"):
+        return "ad hoc tasks"
+    if run.get("suite_version") is None:
+        return f"{run['suite_id']} ({run.get('labels', {}).get('filter', 'filtered')})"
+    return f"{run['suite_id']} v{run['suite_version']}"
 
 
 def _header(k: int) -> tuple[str, ...]:

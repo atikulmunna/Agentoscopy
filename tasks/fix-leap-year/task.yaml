@@ -1,0 +1,30 @@
+id: fix-leap-year
+category: bugfix
+difficulty: easy
+tags:
+- dates
+instructions: 'is_leap in calendar_utils.py treats every year divisible by 4 as a leap year. Apply the
+
+  Gregorian rule: century years are leap years only when divisible by 400.
+
+  '
+environment:
+  base_image: python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
+  workdir: /workspace
+budget:
+  timeout_s: 300
+graders:
+- name: hidden_tests
+  type: command
+  run: python -m unittest discover -s /hidden
+  weight: 0.8
+- name: existing_tests
+  type: command
+  run: python -m unittest discover -s tests
+  weight: 0.2
+- name: no_tamper
+  type: tamper_check
+  protected_paths:
+  - /workspace/tests/**
+  - '**/conftest.py'
+  weight: 0

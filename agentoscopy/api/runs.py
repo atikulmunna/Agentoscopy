@@ -30,6 +30,7 @@ from agentoscopy.launch import (
     execute_run,
 )
 from agentoscopy.sandbox.base import SandboxBackend
+from agentoscopy.scheduler.plan import TaskFilter
 from agentoscopy.scheduler.recovery import cancel_run
 from agentoscopy.scheduler.runner import REVIEW_RATE
 from agentoscopy.spec import SLUG_PATTERN
@@ -49,6 +50,7 @@ FIELDS = frozenset(
         "labels",
         "judge_model",
         "review_rate",
+        "filter",
     }
 )
 MAX_TRIALS = 1000
@@ -177,6 +179,7 @@ def parse_request(body: dict[str, Any], configs_dir: Path) -> RunRequest:
         labels=_labels(body.get("labels", {})),
         judge_model=judge_model,
         review_rate=float(review_rate),
+        task_filter=_task_filter(body.get("filter", {})),
     )
 
 
@@ -187,6 +190,27 @@ def _agent_path(agent: Any, configs_dir: Path) -> Path:
     if not path.is_file():
         raise ApiError(422, "UNKNOWN_AGENT", f"no agent config {agent!r}")
     return path
+
+
+def _task_filter(spec: Any) -> TaskFilter:
+    """`filter`: lists of `tags`, `categories`, and `difficulties`, and a `failed_in` run id."""
+    lists = ("tags", "categories", "difficulties")
+    if not isinstance(spec, dict) or set(spec) - {*lists, "failed_in"}:
+        raise _bad("filter may hold tags, categories, difficulties, and failed_in")
+    values = {}
+    for name in lists:
+        items = spec.get(name, [])
+        if not (isinstance(items, list) and len(items) <= MAX_LABELS):
+            raise _bad(f"filter.{name} must be a list of up to {MAX_LABELS} names")
+        if not all(isinstance(item, str) and 0 < len(item) <= MAX_TEXT for item in items):
+            raise _bad(f"filter.{name} must be a list of up to {MAX_LABELS} names")
+        values[name] = frozenset(items)
+    failed_in = spec.get("failed_in")
+    if failed_in is not None and not (
+        isinstance(failed_in, str) and 0 < len(failed_in) <= MAX_TEXT
+    ):
+        raise _bad("filter.failed_in must be a run id")
+    return TaskFilter(values["tags"], values["categories"], values["difficulties"], failed_in)
 
 
 def _bounded_int(body: dict[str, Any], name: str, default: int, maximum: int) -> int:

@@ -19,6 +19,7 @@ from aiohttp import web
 
 from agentoscopy.api.runs import RunService
 from agentoscopy.api.server import create_app
+from agentoscopy.cli.agent import agent_check_command
 from agentoscopy.cli.ci import ci_command
 from agentoscopy.cli.common import (
     DB_NAME,
@@ -27,7 +28,7 @@ from agentoscopy.cli.common import (
     all_task_ids,
 )
 from agentoscopy.cli.manage import cancel_command, gc_command
-from agentoscopy.cli.run import run_command, start_proxy
+from agentoscopy.cli.run import replay_command, run_command, start_proxy
 from agentoscopy.cli.validate import validate_command
 from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
 from agentoscopy.reporting import NotFound, comparison, run_summary
@@ -79,6 +80,14 @@ def _parser() -> argparse.ArgumentParser:
     listing = task_commands.add_parser("list", parents=[common], help="tasks and validation status")
     listing.set_defaults(handler=_list_command)
 
+    agent = commands.add_parser("agent", help="check agent configs")
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    check = agent_commands.add_parser(
+        "check", parents=[common], help="try a config on the built-in smoke task (WF-02)"
+    )
+    check.add_argument("config", type=Path, help="agent config YAML file")
+    check.set_defaults(handler=agent_check_command)
+
     run = commands.add_parser(
         "run", parents=[common, run_options], help="run a suite or tasks with an agent"
     )
@@ -94,7 +103,20 @@ def _parser() -> argparse.ArgumentParser:
     selection.add_argument(
         "--resume", metavar="RUN_ID", help="continue an unfinished run, e.g. after a crash"
     )
+    selecting = run.add_argument_group("choosing tasks (FR-RUN-02); repeat an option for any of")
+    selecting.add_argument("--tag", action="append", metavar="TAG")
+    selecting.add_argument("--category", action="append", metavar="CATEGORY")
+    selecting.add_argument("--difficulty", action="append", choices=("easy", "medium", "hard"))
+    selecting.add_argument(
+        "--failed-in", metavar="RUN_ID", help="only tasks that failed in this run"
+    )
     run.set_defaults(handler=run_command)
+
+    replay = commands.add_parser(
+        "replay", parents=[common], help="rerun a trial from its recorded model calls (WF-11)"
+    )
+    replay.add_argument("trial_id")
+    replay.set_defaults(handler=replay_command)
 
     cancel = commands.add_parser("cancel", parents=[common], help="cancel a run (WF-12)")
     cancel.add_argument("run_id")

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agentoscopy.cli.common import (
     DB_NAME,
+    EXIT_CHECK_FAILED,
     EXIT_ENVIRONMENT,
     EXIT_INTERRUPTED,
     EXIT_INVALID_INPUT,
@@ -23,13 +24,14 @@ from agentoscopy.launch import (
     LaunchError,
     PreparedRun,
     RunRequest,
+    create_replay,
     create_run,
     execute_run,
     resume_run,
 )
 from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.docker import DockerBackend
-from agentoscopy.scheduler.plan import estimate_cost
+from agentoscopy.scheduler.plan import TaskFilter, estimate_cost
 from agentoscopy.scheduler.runner import TrialProgress
 from agentoscopy.spec import config_hash
 from agentoscopy.stats.report import render
@@ -64,6 +66,8 @@ def start_proxy() -> tuple[CredentialProxy | None, int | None]:
 def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
     dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
     try:
+        if args.resume and (args.tag or args.category or args.difficulty or args.failed_in):
+            raise ValueError("a resumed run keeps its tasks; it takes no task filters")
         if args.resume:
             prepared = resume_run(
                 store,
@@ -85,9 +89,55 @@ def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) 
     return EXIT_BY_STATUS.get(status, EXIT_ENVIRONMENT)
 
 
+def replay_command(args: argparse.Namespace) -> int:
+    """`agentoscopy replay <trial_id>`: rerun a trial against its recorded model calls."""
+    proxy, failure = start_proxy()  # judges grade the replay live
+    if failure is not None:
+        return failure
+    store = Store(args.home / DB_NAME)
+    try:
+        dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
+        try:
+            prepared = create_replay(store, dirs, args.trial_id, has_credentials=proxy is not None)
+        except LaunchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_INVALID_INPUT
+        status = execute_with_progress(store, prepared, args.home, proxy)
+        if status != "completed":
+            return EXIT_BY_STATUS.get(status, EXIT_ENVIRONMENT)
+        return _replay_verdict(store, prepared.run_id, args.trial_id)
+    finally:
+        store.close()
+        if proxy:
+            proxy.stop()
+
+
+def _replay_verdict(store: Store, run_id: str, source_id: str) -> int:
+    (replayed,) = store.trial_rows(run_id)
+    source = store.get_trial(source_id)
+    if replayed["error_code"] == "REPLAY_DIVERGED":
+        print(f"FAIL {replayed['error']}; see trial {replayed['trial_id']}")
+        return EXIT_CHECK_FAILED
+    print(
+        f"replay {replayed['trial_id']}: {replayed['outcome']} after {replayed['steps']} model "
+        f"calls; original {source_id}: {source['outcome']} after {source['steps']}"
+    )
+    if (replayed["outcome"], replayed["steps"]) == (source["outcome"], source["steps"]):
+        print("reproduced: same outcome from the same model calls")
+        return EXIT_OK
+    print("FAIL not reproduced: the replay ended differently")
+    return EXIT_CHECK_FAILED
+
+
 def run_request(args: argparse.Namespace, extra_labels: dict[str, str] | None = None) -> RunRequest:
     if not args.agent:
         raise ValueError("--agent is required unless you pass --resume")
+    task_filter = TaskFilter(
+        tags=frozenset(getattr(args, "tag", None) or ()),
+        categories=frozenset(getattr(args, "category", None) or ()),
+        difficulties=frozenset(getattr(args, "difficulty", None) or ()),
+        failed_in=getattr(args, "failed_in", None),
+    )
     return RunRequest(
         agent=args.agent,
         suite=args.suite,
@@ -99,6 +149,7 @@ def run_request(args: argparse.Namespace, extra_labels: dict[str, str] | None = 
         labels={**labels(args.label), **(extra_labels or {})},
         judge_model=args.judge_model,
         review_rate=args.review_rate,
+        task_filter=task_filter,
     )
 
 
@@ -113,7 +164,7 @@ def execute_with_progress(
     """Execute a prepared run with live progress. Returns its final status, or None after a
     harness failure (reported on stderr)."""
     settings = prepared.settings
-    if not resumed:
+    if not resumed and prepared.replay is None:
         estimate = estimate_cost(
             store, prepared.pinned, config_hash(prepared.config), settings.trials_per_task
         )
@@ -123,6 +174,8 @@ def execute_with_progress(
         print(f"estimated cost ${estimate:.2f}, budget {budget_text}{truncation}")
     finished, total = store.progress(prepared.run_id)
     action = f"resuming at {finished} of {total} trials" if resumed else f"{total} trials"
+    if prepared.replay is not None:
+        action = f"replaying {len(prepared.replay)} recorded model calls"
     print(
         f"run {prepared.run_id}: {action}, concurrency {settings.concurrency}, "
         f"seed {settings.seed}",

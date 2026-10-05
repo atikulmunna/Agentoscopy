@@ -1,0 +1,30 @@
+id: fix-word-count-whitespace
+category: bugfix
+difficulty: easy
+tags:
+- strings
+instructions: 'word_count in textstats.py miscounts text with repeated spaces, tabs, or newlines, and
+
+  returns 1 for an empty string. Words are runs of non-whitespace characters. Fix it.
+
+  '
+environment:
+  base_image: python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
+  workdir: /workspace
+budget:
+  timeout_s: 300
+graders:
+- name: hidden_tests
+  type: command
+  run: python -m unittest discover -s /hidden
+  weight: 0.8
+- name: existing_tests
+  type: command
+  run: python -m unittest discover -s tests
+  weight: 0.2
+- name: no_tamper
+  type: tamper_check
+  protected_paths:
+  - /workspace/tests/**
+  - '**/conftest.py'
+  weight: 0

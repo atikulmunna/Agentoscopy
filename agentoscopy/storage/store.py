@@ -25,7 +25,7 @@ from agentoscopy.worker.trial import AttemptResult
 IN_FLIGHT_STATES = ("PROVISIONING", "RUNNING", "GRADING")
 ACTIVE_RUN_STATUSES = ("pending", "running", "cancelling")
 LEASE_S = 30.0  # a worker's process renews its leases well within this (FR-EXE-01)
-SCHEMA_VERSION = 3  # bump whenever SCHEMA changes, and add a migration
+SCHEMA_VERSION = 4  # bump whenever SCHEMA changes, and add a migration
 REVIEW_PRIORITY = "CASE sample_source WHEN 'low_confidence' THEN 0 WHEN 'random' THEN 1 ELSE 2 END"
 RUN_LISTING = """
 SELECT runs.*, agent_configs.name AS config_name, run_summaries.summary AS summary,
@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS trials (
   judge_cost_usd REAL NOT NULL DEFAULT 0,
   original_outcome TEXT,  -- set when a reviewer overrides the outcome (FR-REV-06)
   lease_expires_at REAL,  -- epoch seconds; renewed while the trial is in flight
+  source_trial_id TEXT,  -- for a replay: the trial it reran (WF-11)
   UNIQUE (run_id, task_id, trial_index)
 );
 CREATE TABLE IF NOT EXISTS trial_attempts (
@@ -119,6 +120,9 @@ ALTER TABLE trials ADD COLUMN lease_expires_at REAL;
 ALTER TABLE trial_attempts ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE trial_attempts ADD COLUMN model_latency_s REAL NOT NULL DEFAULT 0;
 """,
+    3: """
+ALTER TABLE trials ADD COLUMN source_trial_id TEXT;
+""",
 }
 
 
@@ -144,6 +148,7 @@ class NewTrial:
     trial_index: int
     dispatch_order: int
     cost_cap_usd: float
+    source_trial_id: str | None = None  # for a replay
 
 
 @dataclass(frozen=True)
@@ -176,6 +181,7 @@ class RunSettings:
     labels: dict[str, str] = field(default_factory=dict)
     judge_model: str | None = None
     review_rate: float | None = None
+    mode: str = "live"  # live | replay
 
 
 class Store:
@@ -294,26 +300,26 @@ class Store:
             )
             return version
 
+    def save_config(self, config: AgentConfig) -> str:
+        """Record an agent config under its hash (FR-AGT-02); returns the hash."""
+        return _save_config(self._conn, config)
+
     def create_run(self, config: AgentConfig, settings: RunSettings, trials: list[NewTrial]) -> str:
         run_id = str(uuid.uuid4())
-        digest = config_hash(config)
         with self._transaction() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO agent_configs "
-                "(config_hash, name, adapter, spec, created_at) VALUES (?, ?, ?, ?, ?)",
-                (digest, config.name, config.adapter, config.model_dump_json(), _now()),
-            )
+            digest = _save_config(conn, config)
             conn.execute(
                 "INSERT INTO runs (run_id, suite_id, suite_version, config_hash, trials_per_task, "
                 "mode, status, budget_usd, seed, concurrency, labels, harness_version, "
                 "judge_model, review_rate, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 'live', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     settings.suite_id,
                     settings.suite_version,
                     digest,
                     settings.trials_per_task,
+                    settings.mode,
                     settings.budget_usd,
                     settings.seed,
                     settings.concurrency,
@@ -326,7 +332,8 @@ class Store:
             )
             conn.executemany(
                 "INSERT INTO trials (trial_id, run_id, task_id, task_version, trial_index, "
-                "dispatch_order, cost_cap_usd, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED')",
+                "dispatch_order, cost_cap_usd, state, source_trial_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?)",
                 [
                     (
                         str(uuid.uuid4()),
@@ -336,6 +343,7 @@ class Store:
                         trial.trial_index,
                         trial.dispatch_order,
                         trial.cost_cap_usd,
+                        trial.source_trial_id,
                     )
                     for trial in trials
                 ],
@@ -889,6 +897,17 @@ class Store:
             "model_latency_s": attempts[3],
         }
 
+    def tasks_not_passed(self, run_id: str) -> set[str] | None:
+        """Tasks with a trial that failed or hit an infra error in the run (None: no run)."""
+        if self.run_status(run_id) is None:
+            return None
+        rows = self._conn.execute(
+            "SELECT DISTINCT task_id FROM trials WHERE run_id = ? "
+            "AND outcome IN ('fail', 'infra_error')",
+            (run_id,),
+        )
+        return {row["task_id"] for row in rows}
+
     def run_task_versions(self, run_id: str) -> list[TaskVersion]:
         """The task versions a run pinned, so it can be resumed exactly as it started."""
         rows = self._conn.execute(
@@ -948,7 +967,8 @@ class Store:
     def historical_mean_cost(self, task_id: str, digest: str) -> float | None:
         return self._conn.execute(
             "SELECT AVG(t.cost_usd) FROM trials t JOIN runs r USING (run_id) "
-            "WHERE t.task_id = ? AND r.config_hash = ? AND t.outcome IN ('pass', 'fail')",
+            "WHERE t.task_id = ? AND r.config_hash = ? AND t.outcome IN ('pass', 'fail') "
+            "AND r.mode = 'live'",  # replays cost nothing, which says nothing
             (task_id, digest),
         ).fetchone()[0]
 
@@ -999,6 +1019,16 @@ def _task_version(row: sqlite3.Row) -> TaskVersion:
 
 def _final_state(result: AttemptResult) -> str:
     return {"infra_error": "INFRA_ERROR", "cancelled": "CANCELLED"}.get(result.outcome, "COMPLETED")
+
+
+def _save_config(conn: sqlite3.Connection, config: AgentConfig) -> str:
+    digest = config_hash(config)
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_configs "
+        "(config_hash, name, adapter, spec, created_at) VALUES (?, ?, ?, ?, ?)",
+        (digest, config.name, config.adapter, config.model_dump_json(), _now()),
+    )
+    return digest
 
 
 def _cancel_queued(conn: sqlite3.Connection, run_id: str) -> None:

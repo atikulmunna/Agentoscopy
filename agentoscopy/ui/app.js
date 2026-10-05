@@ -257,7 +257,9 @@ function errorState(error) {
 }
 
 function runName(run) {
-  return run.suite_id ? `${run.suite_id} v${run.suite_version}` : "Ad hoc tasks";
+  if (run.mode === "replay") return "Replay";
+  if (!run.suite_id) return "Ad hoc tasks";
+  return run.suite_version == null ? `${run.suite_id}, filtered` : `${run.suite_id} v${run.suite_version}`;
 }
 
 function statusText(run) {
@@ -639,6 +641,15 @@ async function trialView(trialId) {
       { class: "lede" },
       "Part of run ",
       h("a", { href: `#/runs/${enc(trial.run_id)}` }, shortId(trial.run_id)),
+      trial.source_trial_id
+        ? [
+            ", a replay of trial ",
+            h("a", { href: `#/trials/${enc(trial.source_trial_id)}` }, shortId(trial.source_trial_id)),
+            " (",
+            h("a", { href: `#/side/${enc(trial.source_trial_id)}/${enc(trial.trial_id)}` }, "side by side"),
+            ")",
+          ]
+        : null,
       trial.attempt > 1 ? `. Attempt ${trial.attempt}; earlier attempts ended in infra errors and were retried.` : ".",
     ),
     h("div", { class: "facts" }, facts.map(([label, value]) => h("span", {}, `${label} `, h("b", {}, String(value))))),

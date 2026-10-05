@@ -23,6 +23,7 @@ from pathlib import Path
 from agentoscopy.adapters.base import AgentAdapter
 from agentoscopy.adapters.python import load_python_adapter
 from agentoscopy.gateway.server import Gateway
+from agentoscopy.replay import RecordedCall
 from agentoscopy.sandbox.base import SandboxBackend
 from agentoscopy.scheduler.plan import PinnedTask
 from agentoscopy.scheduler.recovery import MAX_ATTEMPTS, reclaim_expired
@@ -75,6 +76,7 @@ class RunExecutor:
         review_rate: float = REVIEW_RATE,
         lease_s: float = LEASE_S,
         heartbeat_s: float = HEARTBEAT_S,
+        replay: tuple[RecordedCall, ...] | None = None,
     ) -> None:
         self._store = store
         self._run_id = run_id
@@ -91,6 +93,7 @@ class RunExecutor:
         self._judge_model = judge_model
         self._review_rate = review_rate
         self._lease_s = lease_s
+        self._replay = replay
         self._heartbeat_s = heartbeat_s
         self._changed = asyncio.Condition()
         self._cancel = asyncio.Event()
@@ -176,6 +179,7 @@ class RunExecutor:
             image_digest=pinned.image_digest,
             verified_graders=pinned.verified_graders,
             judge_model=self._judge_model,
+            replay=self._replay,
         )
         result = await run_attempt(
             spec,

@@ -172,6 +172,7 @@ def test_a_version_2_database_is_migrated_in_place(tmp_path):
             ("trials", "lease_expires_at"),
             ("trial_attempts", "model_calls"),
             ("trial_attempts", "model_latency_s"),
+            ("trials", "source_trial_id"),  # added in version 4
         ]:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
         conn.execute("PRAGMA user_version = 2")
@@ -181,6 +182,7 @@ def test_a_version_2_database_is_migrated_in_place(tmp_path):
 
     assert store.get_run(run_id)["review_rate"] is None
     assert store.trial_rows(run_id)[0]["lease_expires_at"] is None
+    assert store.trial_rows(run_id)[0]["source_trial_id"] is None
     assert claim(store, run_id) is not None
     store.close()
     with sqlite3.connect(path) as conn:

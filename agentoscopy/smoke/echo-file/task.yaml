@@ -1,0 +1,19 @@
+# The built-in smoke task for `agentoscopy agent check` (WF-02, FR-AGT-03).
+id: echo-file
+category: smoke
+instructions: |
+  Read the file input.txt in the working directory and write its contents reversed,
+  character by character, to a new file output.txt in the same directory.
+environment:
+  base_image: python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
+  workdir: /workspace
+budget:
+  max_steps: 10
+  max_cost_usd: 0.1
+  timeout_s: 120
+graders:
+  - name: reversed
+    type: command
+    run: >-
+      python -c "import pathlib; text = pathlib.Path('input.txt').read_text();
+      raise SystemExit(pathlib.Path('output.txt').read_text().strip() != text.strip()[::-1])"

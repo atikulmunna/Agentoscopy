@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from agentoscopy.gateway.pricing import is_mock, price_for
-from agentoscopy.spec import Task, load_task
+from agentoscopy.spec import Task, TaskSpec, load_task
 from agentoscopy.storage.store import NewTrial, Store
 
 MIN_CRITICAL_TRIALS = 6  # with fewer, a one-sided Fisher test cannot flag a regression
@@ -23,6 +23,59 @@ class PinnedTask:
     version: int
     image_digest: str | None
     verified_graders: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TaskFilter:
+    """Narrows a run to some of its tasks (FR-RUN-02). Several values for one field are
+    alternatives; the fields themselves must all match."""
+
+    tags: frozenset[str] = field(default_factory=frozenset)
+    categories: frozenset[str] = field(default_factory=frozenset)
+    difficulties: frozenset[str] = field(default_factory=frozenset)
+    failed_in: str | None = None  # a run whose failed tasks to take
+
+    def __bool__(self) -> bool:
+        return bool(self.tags or self.categories or self.difficulties or self.failed_in)
+
+    def keeps(self, spec: TaskSpec, failed: set[str] | None) -> bool:
+        return (
+            (not self.tags or bool(self.tags & set(spec.tags)))
+            and (not self.categories or spec.category in self.categories)
+            and (not self.difficulties or spec.difficulty in self.difficulties)
+            and (failed is None or spec.id in failed)
+        )
+
+    def describe(self) -> str:
+        parts = [
+            f"{name}={'|'.join(sorted(values))}"
+            for name, values in (
+                ("tag", self.tags),
+                ("category", self.categories),
+                ("difficulty", self.difficulties),
+            )
+            if values
+        ]
+        return " ".join(parts + ([f"failed-in={self.failed_in}"] if self.failed_in else []))
+
+
+def select_tasks(
+    store: Store, tasks_dir: Path, task_ids: list[str], task_filter: TaskFilter
+) -> list[str]:
+    """The task ids the filter keeps, in their original order."""
+    failed = None
+    if task_filter.failed_in:
+        failed = store.tasks_not_passed(task_filter.failed_in)
+        if failed is None:
+            raise PlanError(f"NOT_FOUND: no run {task_filter.failed_in}")
+    kept = [
+        task_id
+        for task_id in task_ids
+        if task_filter.keeps(load_task(tasks_dir, task_id).spec, failed)
+    ]
+    if not kept:
+        raise PlanError(f"NO_TASKS_SELECTED: no task matches {task_filter.describe()}")
+    return kept
 
 
 def pin_tasks(store: Store, tasks_dir: Path, task_ids: list[str]) -> list[PinnedTask]:

@@ -20,6 +20,7 @@ from agentoscopy.graders.fsdiff import since_baseline
 from agentoscopy.graders.judge import GatewayJudge
 from agentoscopy.graders.pipeline import grade_snapshot
 from agentoscopy.recorder.trajectory import TrajectoryRecorder, read_events
+from agentoscopy.replay import RecordedCall
 from agentoscopy.sandbox.base import ManagedSandbox, SandboxBackend, SandboxError
 from agentoscopy.sandbox.recording import RecordingSandbox
 from agentoscopy.spec import AgentConfig, Task, config_hash
@@ -45,6 +46,10 @@ class ProviderError(Exception):
     """The model provider stayed unavailable after the gateway's retries (WF-04 E3)."""
 
 
+class ReplayDiverged(Exception):
+    """The agent did not send the requests the replayed trial recorded (FR-RPL-02)."""
+
+
 class AttemptCancelled(Exception):
     """The run is being cancelled, and this attempt had not reached grading (WF-12)."""
 
@@ -54,6 +59,7 @@ INFRA_ERRORS: tuple[tuple[type[Exception], str], ...] = (
     (TaskImageChanged, "TASK_IMAGE_CHANGED"),
     (GraderError, "GRADER_UNSTABLE"),
     (ProviderError, "PROVIDER_ERROR"),
+    (ReplayDiverged, "REPLAY_DIVERGED"),
     (SandboxError, "SANDBOX_ERROR"),
 )
 
@@ -69,6 +75,7 @@ class AttemptSpec:
     image_digest: str | None = None
     verified_graders: frozenset[str] = frozenset()
     judge_model: str | None = None  # pinned per run; used only by llm_judge graders
+    replay: tuple[RecordedCall, ...] | None = None  # answer model calls from a recording
 
 
 @dataclass(frozen=True)
@@ -202,7 +209,10 @@ async def _execute(
     await run_setup(sandbox, task)
     baseline = await sandbox.diff() if task.spec.environment.setup else ""
     _check(cancel)
-    session = gateway.open_session(spec.trial_id, task.spec.budget, recorder, spec.seed_key)
+    replay = list(spec.replay) if spec.replay is not None else None
+    session = gateway.open_session(
+        spec.trial_id, task.spec.budget, recorder, spec.seed_key, replay=replay
+    )
     resources.session = session
     on_state("RUNNING")
     try:
@@ -213,6 +223,8 @@ async def _execute(
         gateway.close_session(session)
     if session.provider_error:
         raise ProviderError(session.provider_error)
+    if session.replay_divergence:
+        raise ReplayDiverged(f"REPLAY_DIVERGED at {session.replay_divergence}")
     fs_diff = since_baseline(await sandbox.diff(), baseline)
     recorder.store_artifact("final_state.diff", fs_diff.encode())
     resources.final_state_path = recorder.artifacts_dir / "final_state.diff"

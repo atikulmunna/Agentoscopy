@@ -37,7 +37,10 @@ class Network(_Spec):
     @classmethod
     def _deny_all_only(cls, allow: list[str]) -> list[str]:
         if allow:
-            raise ValueError("egress allowlists need the model gateway (M1); only [] is supported")
+            raise ValueError(
+                "network allowlists are not supported yet: sandboxes have no network, so "
+                "install what a task needs in environment.build, which runs with network"
+            )
         return allow
 
 

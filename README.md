@@ -25,6 +25,8 @@ uv run agentoscopy run --suite example --agent configs/scripted-fix.yaml --trial
 uv run agentoscopy report <run_id> --format md          # table, md, or json
 uv run agentoscopy compare <baseline_run> <candidate_run>
 uv run agentoscopy run --resume <run_id>                # continue a run after a crash
+uv run agentoscopy replay <trial_id>                    # rerun a trial from its recorded model calls
+uv run agentoscopy agent check configs/claude.yaml      # try an agent config before a real run
 uv run agentoscopy cancel <run_id>
 uv run agentoscopy gc --older-than 30d                  # old run outputs, orphaned sandboxes
 uv run agentoscopy serve                                # web UI; open the URL it prints
@@ -34,6 +36,12 @@ uv run agentoscopy serve                                # web UI; open the URL i
 ceiling, default 10), `--concurrency`, `--seed`, `--label KEY=VALUE`, `--judge-model`
 (default `claude-opus-5-5`), and `--review-rate` (the fraction of trials sampled for human
 review, default 0.05). A task can only run once its current content has been validated.
+
+To run only some of a suite's tasks, add `--tag`, `--category`, `--difficulty`, or
+`--failed-in RUN_ID` (the tasks that failed or hit an infra error in that run). Repeat an
+option for any of several values; different options must all match. A filtered run keeps
+the suite's name but no suite version, so it never stands in for a full run of the suite
+(as a CI baseline, say), and it records the filter as a label.
 
 The example task has an LLM judge grader, so validating and running it calls the judge
 model, which needs `ANTHROPIC_API_KEY`. To try everything offline, add `--judge-model mock`
@@ -171,6 +179,13 @@ Anthropic SDK's `base_url` and `api_key`.
   `ANTHROPIC_API_KEY`. The key is handed to a separate credential-proxy process and removed
   from the `agentoscopy` process before any agent code is imported.
 
+`agentoscopy agent check <config>` runs a config once on a built-in smoke task (reverse a
+file's contents). It passes when the agent called a model through the gateway, acted in
+the sandbox or reported a message, and finished on its own. It fails with `GATEWAY_BYPASS`
+when the agent ignored the endpoint it was given, `NO_AGENT_EVENTS`, or
+`AGENT_DID_NOT_FINISH`. Whether the agent solved the smoke task is reported but does not
+decide the check.
+
 Once a trial's step, token, or cost budget is spent, the gateway rejects further calls with
 HTTP 400 and error type `budget_exceeded_error` (`agentoscopy.adapters.base.BUDGET_EXCEEDED_ERROR`).
 
@@ -184,8 +199,20 @@ A task lives in `tasks/<id>/`:
 - `hidden/`: grader-only files, mounted read-only at `/hidden` during grading only
 - `reference/`: optional reference solution; its files overlay the workdir during validation
 
-Suites live in `suites/<name>.yaml` as a name and a list of task ids. The run database,
-trajectories, and artifacts are written under `.agentoscopy/`.
+Suites live in `suites/<name>.yaml` as a name and a list of task ids. `core` holds twenty
+small Python bug fixes and features of mixed difficulty, each with visible tests, hidden
+tests, a reference solution, and the tamper check; `example` holds the one task with an LLM
+judge. The run database, trajectories, and artifacts are written under `.agentoscopy/`.
+
+## Replay
+
+`agentoscopy replay <trial_id>` reruns a recorded trial in a fresh sandbox with the same
+task version, agent config, and seed. Each model call is answered with the response
+recorded at the same step, at no cost, as long as the agent sends the same request it sent
+then; tool calls run live. A different request, or a call the original never made, stops
+the replay with `REPLAY_DIVERGED` at that step. The command exits `0` when the replay ends
+with the original outcome after the same model calls, and `1` otherwise. A replay is its
+own one-trial run; its trial page links to the original and to a side-by-side view.
 
 ## Tests
 

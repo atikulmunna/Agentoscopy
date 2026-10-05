@@ -240,3 +240,53 @@ def wait_for_crash_point(store, process):
                 return run_id
         time.sleep(0.2)
     raise AssertionError("the run never reached a point worth crashing at")
+
+
+def test_the_smoke_task_is_sound_and_agent_check_passes_a_working_agent(tmp_path, capsys):
+    from agentoscopy.agent_check import SMOKE_TASK_ID, SMOKE_TASKS_DIR
+
+    report = asyncio.run(validate_task(load_task(SMOKE_TASKS_DIR, SMOKE_TASK_ID), DockerBackend()))
+    assert report.ok, f"{report.error_code}: {report.message}"  # fails untouched, passes reference
+    agent = tmp_path / "echo.yaml"
+    script = [
+        {"model_calls": 1},
+        {"exec": "python -c \"import pathlib; p = pathlib.Path('input.txt'); "
+                 "pathlib.Path('output.txt').write_text(p.read_text()[::-1])\""},
+    ]  # fmt: skip
+    agent.write_text(
+        yaml.safe_dump(
+            {
+                "name": "echo",
+                "adapter": "python",
+                "entrypoint": "agentoscopy.testing.scripted_agent:ScriptedAgent",
+                "params": {"script": script},
+            }
+        )
+    )
+
+    assert main(["agent", "check", str(agent), "--home", str(tmp_path / "home")]) == 0
+    out = capsys.readouterr().out
+    assert "smoke task: pass" in out and "ok: the config is ready to run" in out
+
+
+def test_a_replay_reproduces_a_recorded_trial(tmp_path, capsys):
+    """M5 exit criterion (part one): replay reproduces a recorded trial, without model spend."""
+    common = ["--home", str(tmp_path / "home"), "--tasks-dir", str(REPO / "tasks")]
+    judged = [*common, "--judge-model", "mock"]
+    agent = str(REPO / "configs" / "scripted-fix.yaml")
+    assert main(["task", "validate", TASK_ID, *judged]) == 0
+    assert main(["run", "--task", TASK_ID, "--agent", agent, "--trials", "1", *judged]) == 0
+    store = Store(tmp_path / "home" / "agentoscopy.db")
+    try:
+        (source,) = store.trial_rows(store.list_runs()[0]["run_id"])
+        capsys.readouterr()
+
+        assert main(["replay", source["trial_id"], *common]) == 0
+
+        assert "reproduced" in capsys.readouterr().out
+        (replayed,) = store.trial_rows(store.list_runs()[0]["run_id"])
+        assert (replayed["outcome"], replayed["steps"]) == (source["outcome"], source["steps"])
+        assert replayed["cost_usd"] == 0
+        assert leftovers("ps", replayed["trial_id"]) == ""
+    finally:
+        store.close()

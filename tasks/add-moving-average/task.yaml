@@ -1,0 +1,33 @@
+id: add-moving-average
+category: feature
+difficulty: medium
+tags:
+- math
+instructions: 'Implement moving_average(values, window) in series.py. It returns the mean of each run
+  of
+
+  `window` consecutive values, in order, so it has len(values) - window + 1 entries, or none
+
+  when the window is longer than the data. A window below 1 raises ValueError.
+
+  '
+environment:
+  base_image: python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
+  workdir: /workspace
+budget:
+  timeout_s: 300
+graders:
+- name: hidden_tests
+  type: command
+  run: python -m unittest discover -s /hidden
+  weight: 0.8
+- name: existing_tests
+  type: command
+  run: python -m unittest discover -s tests
+  weight: 0.2
+- name: no_tamper
+  type: tamper_check
+  protected_paths:
+  - /workspace/tests/**
+  - '**/conftest.py'
+  weight: 0
