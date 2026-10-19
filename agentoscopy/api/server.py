@@ -18,7 +18,7 @@ from typing import Any
 from aiohttp import web
 from yarl import URL
 
-from agentoscopy.api import reviews
+from agentoscopy.api import reviews, tags
 from agentoscopy.api import runs as run_api
 from agentoscopy.api.common import (
     ALLOWED_HOSTS,
@@ -70,6 +70,7 @@ def create_app(
     app.router.add_get("/events", _events)
     app.router.add_get("/metrics", _metrics)
     reviews.add_routes(app)
+    tags.add_routes(app)
     default_dirs = Directories(Path("tasks"), Path("suites"), home)
     run_api.add_routes(app, runs or RunService(default_dirs, Path("configs"), DockerBackend()))
     return app

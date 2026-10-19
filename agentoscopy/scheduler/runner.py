@@ -23,12 +23,12 @@ from pathlib import Path
 from agentoscopy.adapters.base import AgentAdapter
 from agentoscopy.adapters.python import load_python_adapter
 from agentoscopy.gateway.server import Gateway
-from agentoscopy.replay import RecordedCall
+from agentoscopy.replay import Playback
 from agentoscopy.sandbox.base import SandboxBackend
-from agentoscopy.scheduler.plan import PinnedTask
+from agentoscopy.scheduler.plan import PinnedTask, top_up_trials
 from agentoscopy.scheduler.recovery import MAX_ATTEMPTS, reclaim_expired
 from agentoscopy.spec import AgentConfig
-from agentoscopy.storage.store import LEASE_S, ClaimedTrial, Store
+from agentoscopy.storage.store import LEASE_S, TOPPED_UP, ClaimedTrial, NewTrial, Store
 from agentoscopy.worker.trial import AttemptResult, AttemptSpec, run_attempt
 
 RETRY_BACKOFF_S = 5.0
@@ -76,7 +76,8 @@ class RunExecutor:
         review_rate: float = REVIEW_RATE,
         lease_s: float = LEASE_S,
         heartbeat_s: float = HEARTBEAT_S,
-        replay: tuple[RecordedCall, ...] | None = None,
+        playback: Playback | None = None,
+        top_up: int = 0,
     ) -> None:
         self._store = store
         self._run_id = run_id
@@ -93,7 +94,8 @@ class RunExecutor:
         self._judge_model = judge_model
         self._review_rate = review_rate
         self._lease_s = lease_s
-        self._replay = replay
+        self._playback = playback
+        self._top_up = top_up
         self._heartbeat_s = heartbeat_s
         self._changed = asyncio.Condition()
         self._cancel = asyncio.Event()
@@ -103,11 +105,11 @@ class RunExecutor:
     async def execute(self) -> None:
         self._store.mark_running(self._run_id)
         try:
-            async with asyncio.TaskGroup() as group:
-                control = group.create_task(self._control())
-                workers = [group.create_task(self._worker(id_)) for id_ in self._worker_ids]
-                await asyncio.wait(workers)  # a failing worker cancels this wait
-                control.cancel()
+            await self._drain()
+            extra = self._top_up_trials()
+            if extra is not None:
+                self._store.add_top_up(self._run_id, extra)
+                await self._drain()
         except asyncio.CancelledError:
             self._store.cancel_unfinished(self._run_id)
             self._store.set_run_status(self._run_id, "cancelled", finished=True)
@@ -117,6 +119,24 @@ class RunExecutor:
             raise
         if not self._store.finalize_cancel(self._run_id):
             self._store.set_run_status(self._run_id, "completed", finished=True)
+
+    async def _drain(self) -> None:
+        """Run trials until the queue is empty and nothing is in flight."""
+        async with asyncio.TaskGroup() as group:
+            control = group.create_task(self._control())
+            workers = [group.create_task(self._worker(id_)) for id_ in self._worker_ids]
+            await asyncio.wait(workers)  # a failing worker cancels this wait
+            control.cancel()
+
+    def _top_up_trials(self) -> list[NewTrial] | None:
+        """The top-up trials still to add, or None when there is no top-up to do: none was
+        asked for, it was done already, the run is being cancelled, or the budget ran out."""
+        run = self._store.get_run(self._run_id)
+        done = {TOPPED_UP, "BUDGET_TRUNCATED"} & set(run["flags"])
+        if not self._top_up or done or run["status"] != "running":
+            return None
+        rows = self._store.trial_rows(self._run_id)
+        return top_up_trials(rows, list(self._tasks.values()), self._top_up)
 
     async def _control(self) -> None:
         last_beat = -self._heartbeat_s
@@ -179,7 +199,7 @@ class RunExecutor:
             image_digest=pinned.image_digest,
             verified_graders=pinned.verified_graders,
             judge_model=self._judge_model,
-            replay=self._replay,
+            playback=self._playback,
         )
         result = await run_attempt(
             spec,

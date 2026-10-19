@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agentoscopy.adapters.python import AdapterLoadError, load_python_adapter
 from agentoscopy.gateway.server import Gateway
-from agentoscopy.replay import RecordedCall, load_recording
+from agentoscopy.replay import Playback, load_recording
 from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.base import SandboxBackend
 from agentoscopy.scheduler.plan import (
@@ -62,6 +62,7 @@ class RunRequest:
     judge_model: str = DEFAULT_JUDGE_MODEL
     review_rate: float = REVIEW_RATE
     task_filter: TaskFilter = field(default_factory=TaskFilter)
+    top_up: int = 0  # extra trials for each task with mixed results
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,7 @@ class PreparedRun:
     pinned: list[PinnedTask]
     config: AgentConfig
     settings: RunSettings
-    replay: tuple[RecordedCall, ...] | None = None  # for a replay run
+    playback: Playback | None = None  # for a replay or fork run
 
 
 def create_run(
@@ -110,6 +111,7 @@ def create_run(
         labels=labels,
         judge_model=judge_model,
         review_rate=request.review_rate,
+        top_up=request.top_up,
     )
     run_id = store.create_run(config, settings, plan_trials(pinned, request.trials, settings.seed))
     return PreparedRun(run_id, pinned, config, settings)
@@ -130,8 +132,11 @@ def resume_run(
         raise LaunchError(f"NOT_FOUND: no run {run_id}")
     if run["status"] not in RESUMABLE:
         raise LaunchError(f"RUN_FINISHED: run {run_id} is already {run['status']}")
-    if run["mode"] == "replay":
-        raise LaunchError("REPLAY_NOT_RESUMABLE: replay the source trial again instead")
+    if run["mode"] != "live":
+        raise LaunchError(
+            f"REPLAY_NOT_RESUMABLE: a {run['mode']} run is not resumed; start it again from "
+            "its source trial"
+        )
     try:
         pinned = [_repin(dirs.tasks, version) for version in store.run_task_versions(run_id)]
         config = AgentConfig.model_validate(store.config_spec(run["config_hash"]))
@@ -151,6 +156,7 @@ def resume_run(
         labels=run["labels"],
         judge_model=run["judge_model"],
         review_rate=REVIEW_RATE if run["review_rate"] is None else run["review_rate"],
+        top_up=run["top_up"],
     )
     return PreparedRun(run_id, pinned, config, settings)
 
@@ -178,7 +184,8 @@ async def execute_run(
         on_progress=on_progress,
         judge_model=settings.judge_model,
         review_rate=REVIEW_RATE if settings.review_rate is None else settings.review_rate,
-        replay=prepared.replay,
+        playback=prepared.playback,
+        top_up=settings.top_up,
     )
     try:
         await executor.execute()
@@ -191,7 +198,46 @@ def create_replay(
     store: Store, dirs: Directories, trial_id: str, *, has_credentials: bool
 ) -> PreparedRun:
     """A one-trial run that reruns a recorded trial (WF-11): same task version, config,
-    and seed, with model calls answered from the trial's final attempt."""
+    and seed, with every model call answered from the trial's final attempt."""
+    return _from_recorded_trial(
+        store, dirs, trial_id, mode="replay", labels={"replay_of": trial_id},
+        has_credentials=has_credentials,
+    )  # fmt: skip
+
+
+def create_fork(
+    store: Store,
+    dirs: Directories,
+    trial_id: str,
+    at_step: int,
+    *,
+    agent: Path | None = None,
+    inject: str | None = None,
+    has_credentials: bool,
+) -> PreparedRun:
+    """A one-trial run that replays a recorded trial up to step `at_step`, then continues live
+    (WF-11, FR-RPL-03): with another agent config, an injected message, or both."""
+    labels = {"fork_of": trial_id, "fork_at": str(at_step)} | (
+        {"injected": "yes"} if inject else {}
+    )
+    return _from_recorded_trial(
+        store, dirs, trial_id, mode="fork", labels=labels, has_credentials=has_credentials,
+        fork_at=at_step, inject=inject, agent=agent,
+    )  # fmt: skip
+
+
+def _from_recorded_trial(
+    store: Store,
+    dirs: Directories,
+    trial_id: str,
+    *,
+    mode: str,
+    labels: dict[str, str],
+    has_credentials: bool,
+    fork_at: int | None = None,
+    inject: str | None = None,
+    agent: Path | None = None,
+) -> PreparedRun:
     trial = store.get_trial(trial_id)
     if trial is None:
         raise LaunchError(f"NOT_FOUND: no trial {trial_id}")
@@ -200,10 +246,18 @@ def create_replay(
     recording = load_recording(trajectory, artifacts) if trajectory.is_file() else []
     if not recording:
         raise LaunchError(f"NO_RECORDING: trial {trial_id} has no recorded model calls")
+    if fork_at is not None and not 1 <= fork_at <= len(recording) + 1:
+        raise LaunchError(
+            f"FORK_STEP_OUT_OF_RANGE: trial {trial_id} recorded {len(recording)} model calls, "
+            f"so a fork can start at step 1 to {len(recording) + 1}"
+        )
     versions = {v.task_id: v for v in store.run_task_versions(source["run_id"])}
     try:
         pinned = _repin(dirs.tasks, versions[trial["task_id"]])
-        config = AgentConfig.model_validate(store.config_spec(source["config_hash"]))
+        if agent is not None:
+            config = load_agent_config(agent)
+        else:
+            config = AgentConfig.model_validate(store.config_spec(source["config_hash"]))
         load_python_adapter(config.entrypoint)
         if source["judge_model"]:
             check_judge([pinned.task], source["judge_model"], has_credentials)
@@ -213,14 +267,14 @@ def create_replay(
         suite_id=None,
         suite_version=None,
         trials_per_task=1,
-        budget_usd=None,  # replayed calls cost nothing
+        budget_usd=None,  # replayed calls cost nothing; a fork's live calls keep the trial budget
         seed=source["seed"],
         concurrency=1,
         harness_version=version("agentoscopy"),
-        labels={"replay_of": trial_id},
+        labels=labels,
         judge_model=source["judge_model"],
         review_rate=0.0,
-        mode="replay",
+        mode=mode,
     )
     new_trial = NewTrial(
         trial["task_id"],
@@ -231,7 +285,8 @@ def create_replay(
         source_trial_id=trial_id,
     )
     run_id = store.create_run(config, settings, [new_trial])
-    return PreparedRun(run_id, [pinned], config, settings, tuple(recording))
+    playback = Playback(tuple(recording), fork_at, inject)
+    return PreparedRun(run_id, [pinned], config, settings, playback)
 
 
 def _repin(tasks_dir: Path, pinned_version: TaskVersion) -> PinnedTask:

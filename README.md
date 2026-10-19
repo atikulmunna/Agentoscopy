@@ -26,6 +26,7 @@ uv run agentoscopy report <run_id> --format md          # table, md, or json
 uv run agentoscopy compare <baseline_run> <candidate_run>
 uv run agentoscopy run --resume <run_id>                # continue a run after a crash
 uv run agentoscopy replay <trial_id>                    # rerun a trial from its recorded model calls
+uv run agentoscopy fork <trial_id> --at-step 3          # the same up to step 3, then live
 uv run agentoscopy agent check configs/claude.yaml      # try an agent config before a real run
 uv run agentoscopy cancel <run_id>
 uv run agentoscopy gc --older-than 30d                  # old run outputs, orphaned sandboxes
@@ -42,6 +43,10 @@ To run only some of a suite's tasks, add `--tag`, `--category`, `--difficulty`, 
 option for any of several values; different options must all match. A filtered run keeps
 the suite's name but no suite version, so it never stands in for a full run of the suite
 (as a CI baseline, say), and it records the filter as a label.
+
+`--top-up N` adds N more trials to every task whose trials both passed and failed, once the
+planned trials are done, so extra trials go where the result is uncertain. A run that hit
+its budget is not topped up, and a resumed run still finishes its top-up.
 
 The example task has an LLM judge grader, so validating and running it calls the judge
 model, which needs `ANTHROPIC_API_KEY`. To try everything offline, add `--judge-model mock`
@@ -91,9 +96,10 @@ forks never run with provider credentials.
 classified as regressed, improved, changed, flaky, stable pass, or stable fail; regressed
 and improved need a one-sided Fisher's exact test at p < 0.05, which takes at least 4
 trials per run (6 for tasks marked `critical`, which get those automatically). The
-verdict is `REGRESSION` when the 95% bootstrap CI of the mean per-task change is below
-zero or a critical task regressed, `IMPROVEMENT` when it is above zero, and
-`NO_SIGNIFICANT_CHANGE` otherwise. The output also shows cost, token, step, and duration
+verdict is `REGRESSION` when the 95% CI of the mean per-task change is below zero or a
+critical task regressed, `IMPROVEMENT` when it is above zero, and `NO_SIGNIFICANT_CHANGE`
+otherwise. The CI is a Student t interval over tasks: comparing a config with itself gives
+a different verdict about 5% of the time, which a test checks. The output also shows cost, token, step, and duration
 deltas, deltas by task category and tag, and a field-level diff of the two agent configs.
 
 ## Grading
@@ -141,6 +147,13 @@ rate, Cohen's kappa, the confusion matrix, and every disagreement. Agreement and
 use only randomly sampled reviews, since low-confidence and hand-added items are hard
 cases by design. A judge with kappa below 0.6 over at least 30 random reviews is
 flagged uncalibrated, and every run that uses it shows a warning.
+
+Failed trials can be tagged from their page, with a tag from a short list (wrong fix,
+incomplete, misread task, and so on) or any other word. The run dashboard and
+`agentoscopy report` count the tags. Reviewers can remove the tags they added; the
+`reward_hacking` tag the tamper check adds stays. The API is `GET /failure-tags`,
+`POST /trials/{trial_id}/tags` with `tag` and an optional `note`, and
+`DELETE /trials/{trial_id}/tags/{tag}`.
 
 ## Web UI
 
@@ -204,7 +217,7 @@ small Python bug fixes and features of mixed difficulty, each with visible tests
 tests, a reference solution, and the tamper check; `example` holds the one task with an LLM
 judge. The run database, trajectories, and artifacts are written under `.agentoscopy/`.
 
-## Replay
+## Replay and fork
 
 `agentoscopy replay <trial_id>` reruns a recorded trial in a fresh sandbox with the same
 task version, agent config, and seed. Each model call is answered with the response
@@ -213,6 +226,13 @@ then; tool calls run live. A different request, or a call the original never mad
 the replay with `REPLAY_DIVERGED` at that step. The command exits `0` when the replay ends
 with the original outcome after the same model calls, and `1` otherwise. A replay is its
 own one-trial run; its trial page links to the original and to a side-by-side view.
+
+`agentoscopy fork <trial_id> --at-step N` answers the model calls before step N from the
+recording, whatever the agent asks, and makes step N and later live. Add `--agent CONFIG`
+to continue with another config, or `--inject TEXT` to add a message to the request at
+step N, and see what would have happened. A recorded answer that calls a tool the new
+config lacks stops the fork with `REPLAY_DIVERGED`. Its trial page links to the original
+and to the side-by-side view.
 
 ## Tests
 

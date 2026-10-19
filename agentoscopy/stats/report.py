@@ -41,6 +41,9 @@ def _headline(summary: dict[str, Any], run: dict[str, Any]) -> list[str]:
         )
     if summary["flaky_tasks"]:
         lines.append(f"flaky: {', '.join(summary['flaky_tasks'])}")
+    if summary.get("failure_tags"):
+        tags = ", ".join(f"{tag} {count}" for tag, count in summary["failure_tags"].items())
+        lines.append(f"failure tags: {tags}")
     if summary["unscored_tasks"]:
         lines.append(f"unscored (no valid trials): {', '.join(summary['unscored_tasks'])}")
     return lines

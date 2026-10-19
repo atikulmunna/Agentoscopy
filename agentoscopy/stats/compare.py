@@ -1,9 +1,14 @@
-"""Run comparison (WF-07): per-task classes, a paired bootstrap of the delta, and a verdict.
+"""Run comparison (WF-07): per-task classes, a CI of the paired delta, and a verdict.
 
 Tasks are compared only where both runs scored the same task version. A task is Regressed or
 Improved only when a one-sided Fisher's exact test says so (p < 0.05); other differences are
-Changed and never affect the verdict. The verdict comes from the bootstrap CI of the mean
+Changed and never affect the verdict. The verdict comes from the 95% CI of the mean
 per-task delta, plus any critical task classified Regressed.
+
+The CI is a Student t interval with tasks as the sampling unit. A percentile bootstrap over
+a suite of 20 tasks and 3 trials came out too narrow: comparing a config with itself gave a
+verdict other than NO_SIGNIFICANT_CHANGE about 7.9% of the time, where the t interval gives
+about 5.6%, close to the 5% intended (acceptance criterion 6).
 """
 
 from __future__ import annotations
@@ -11,21 +16,44 @@ from __future__ import annotations
 import difflib
 from collections import defaultdict
 from dataclasses import dataclass
-from math import comb
-from statistics import fmean
+from math import comb, sqrt
+from statistics import fmean, stdev
 from typing import Any
 
-from agentoscopy.stats.summary import (
-    BOOTSTRAP_RESAMPLES,
-    SCORED_OUTCOMES,
-    bootstrap_ci,
-    slice_rates,
-)
+from agentoscopy.stats.summary import SCORED_OUTCOMES, slice_rates
 
 ALPHA = 0.05
-COMPARE_SEED = 0  # the same two runs always compare the same way
+# Two-sided 97.5th percentiles of Student's t for 1 to 30 degrees of freedom.
+T_975 = (
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+)  # fmt: skip
+Z_975 = 1.959964
 FEW_TASKS_WARNING = 10
 DELTA_METRICS = ("cost_usd", "tokens", "steps", "duration_s")
+
+
+def mean_ci(values: list[float]) -> tuple[float, float]:
+    """95% Student t interval for the mean. A single value has no spread to measure, so its
+    interval is the value itself (and the comparison warns that so few tasks are unreliable)."""
+    mean = fmean(values)
+    if len(values) < 2:
+        return mean, mean
+    half = t_975(len(values) - 1) * stdev(values) / sqrt(len(values))
+    return mean - half, mean + half
+
+
+def t_975(df: int) -> float:
+    if df <= len(T_975):
+        return T_975[df - 1]
+    z = Z_975  # beyond the table, Fisher's expansion is accurate to about 1e-4
+    return (
+        z
+        + (z**3 + z) / (4 * df)
+        + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
+        + (3 * z**7 + 19 * z**5 + 17 * z**3 - 15 * z) / (384 * df**3)
+    )
 
 
 class CompareError(Exception):
@@ -70,7 +98,6 @@ def compare_runs(
     candidate: RunInputs,
     *,
     allow_version_drift: bool = False,
-    resamples: int = BOOTSTRAP_RESAMPLES,
 ) -> dict[str, Any]:
     base_tasks, cand_tasks = _task_stats(baseline.trials), _task_stats(candidate.trials)
     shared, excluded, warnings = _pair(base_tasks, cand_tasks, allow_version_drift)
@@ -82,7 +109,7 @@ def compare_runs(
         for task_id in shared
     ]
     deltas = [row["delta"] for row in rows]
-    ci = bootstrap_ci(deltas, COMPARE_SEED, resamples)
+    ci = mean_ci(deltas)
     if len(rows) < FEW_TASKS_WARNING:
         warnings.append(
             f"only {len(rows)} shared tasks: the CI treats tasks as the sampling unit "

@@ -25,7 +25,8 @@ from agentoscopy.worker.trial import AttemptResult
 IN_FLIGHT_STATES = ("PROVISIONING", "RUNNING", "GRADING")
 ACTIVE_RUN_STATUSES = ("pending", "running", "cancelling")
 LEASE_S = 30.0  # a worker's process renews its leases well within this (FR-EXE-01)
-SCHEMA_VERSION = 4  # bump whenever SCHEMA changes, and add a migration
+SCHEMA_VERSION = 5  # bump whenever SCHEMA changes, and add a migration
+TOPPED_UP = "TOPPED_UP"  # run flag: the adaptive top-up trials were added
 REVIEW_PRIORITY = "CASE sample_source WHEN 'low_confidence' THEN 0 WHEN 'random' THEN 1 ELSE 2 END"
 RUN_LISTING = """
 SELECT runs.*, agent_configs.name AS config_name, run_summaries.summary AS summary,
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS runs (
   config_hash TEXT REFERENCES agent_configs, trials_per_task INTEGER, mode TEXT, status TEXT,
   budget_usd REAL, seed INTEGER, concurrency INTEGER, flags TEXT NOT NULL DEFAULT '[]',
   labels TEXT NOT NULL DEFAULT '{}', harness_version TEXT, judge_model TEXT,
-  created_at TEXT, finished_at TEXT, review_rate REAL
+  created_at TEXT, finished_at TEXT, review_rate REAL,
+  top_up INTEGER NOT NULL DEFAULT 0  -- extra trials per task with mixed results
 );
 CREATE TABLE IF NOT EXISTS trials (
   trial_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs,
@@ -123,6 +125,9 @@ ALTER TABLE trial_attempts ADD COLUMN model_latency_s REAL NOT NULL DEFAULT 0;
     3: """
 ALTER TABLE trials ADD COLUMN source_trial_id TEXT;
 """,
+    4: """
+ALTER TABLE runs ADD COLUMN top_up INTEGER NOT NULL DEFAULT 0;
+""",
 }
 
 
@@ -181,7 +186,8 @@ class RunSettings:
     labels: dict[str, str] = field(default_factory=dict)
     judge_model: str | None = None
     review_rate: float | None = None
-    mode: str = "live"  # live | replay
+    mode: str = "live"  # live | replay | fork
+    top_up: int = 0  # extra trials for each task with mixed results (FR-RUN-10)
 
 
 class Store:
@@ -311,8 +317,8 @@ class Store:
             conn.execute(
                 "INSERT INTO runs (run_id, suite_id, suite_version, config_hash, trials_per_task, "
                 "mode, status, budget_usd, seed, concurrency, labels, harness_version, "
-                "judge_model, review_rate, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                "judge_model, review_rate, top_up, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     settings.suite_id,
@@ -327,28 +333,25 @@ class Store:
                     settings.harness_version,
                     settings.judge_model,
                     settings.review_rate,
+                    settings.top_up,
                     _now(),
                 ),
             )
-            conn.executemany(
-                "INSERT INTO trials (trial_id, run_id, task_id, task_version, trial_index, "
-                "dispatch_order, cost_cap_usd, state, source_trial_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?)",
-                [
-                    (
-                        str(uuid.uuid4()),
-                        run_id,
-                        trial.task_id,
-                        trial.task_version,
-                        trial.trial_index,
-                        trial.dispatch_order,
-                        trial.cost_cap_usd,
-                        trial.source_trial_id,
-                    )
-                    for trial in trials
-                ],
-            )
+            _insert_trials(conn, run_id, trials)
         return run_id
+
+    def add_top_up(self, run_id: str, trials: list[NewTrial]) -> None:
+        """Queue the top-up trials and mark the run topped up, in one transaction, so a
+        crash can never add them twice."""
+        with self._transaction() as conn:
+            _insert_trials(conn, run_id, trials)
+            flags = json.loads(
+                conn.execute("SELECT flags FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
+            )
+            conn.execute(
+                "UPDATE runs SET flags = ? WHERE run_id = ?",
+                (json.dumps(sorted(set(flags) | {TOPPED_UP})), run_id),
+            )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(f"{RUN_LISTING} WHERE runs.run_id = ?", (run_id,)).fetchone()
@@ -646,6 +649,10 @@ class Store:
         if row is None:
             return None
         trial = dict(row)
+        run = self._conn.execute(
+            "SELECT mode, labels FROM runs WHERE run_id = ?", (trial["run_id"],)
+        ).fetchone()
+        trial["run_mode"], trial["run_labels"] = run["mode"], json.loads(run["labels"])
         trial["grades"] = [
             {
                 **dict(grade),
@@ -688,6 +695,36 @@ class Store:
             "INSERT OR REPLACE INTO failure_tags (trial_id, tag, source, note) VALUES (?, ?, ?, ?)",
             (trial_id, tag, source, note),
         )
+
+    def tag_by_hand(self, trial_id: str, tag: str, note: str | None) -> None:
+        """A reviewer's tag (FR-FA-01). Tagging again updates the note; an automatic tag of
+        the same name keeps its source."""
+        self._conn.execute(
+            "INSERT INTO failure_tags (trial_id, tag, source, note) VALUES (?, ?, 'human', ?) "
+            "ON CONFLICT (trial_id, tag) DO UPDATE SET note = excluded.note",
+            (trial_id, tag, note),
+        )
+
+    def failure_tag(self, trial_id: str, tag: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT tag, source, note FROM failure_tags WHERE trial_id = ? AND tag = ?",
+            (trial_id, tag),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def remove_failure_tag(self, trial_id: str, tag: str) -> None:
+        self._conn.execute(
+            "DELETE FROM failure_tags WHERE trial_id = ? AND tag = ?", (trial_id, tag)
+        )
+
+    def failure_tag_counts(self, run_id: str) -> dict[str, int]:
+        """How many of the run's trials carry each tag, most common first."""
+        rows = self._conn.execute(
+            "SELECT f.tag, COUNT(*) AS trials FROM failure_tags f JOIN trials t USING (trial_id) "
+            "WHERE t.run_id = ? GROUP BY f.tag ORDER BY trials DESC, f.tag",
+            (run_id,),
+        )
+        return {row["tag"]: row["trials"] for row in rows}
 
     # Human review (WF-09) ------------------------------------------------------------------
 
@@ -1019,6 +1056,27 @@ def _task_version(row: sqlite3.Row) -> TaskVersion:
 
 def _final_state(result: AttemptResult) -> str:
     return {"infra_error": "INFRA_ERROR", "cancelled": "CANCELLED"}.get(result.outcome, "COMPLETED")
+
+
+def _insert_trials(conn: sqlite3.Connection, run_id: str, trials: list[NewTrial]) -> None:
+    conn.executemany(
+        "INSERT INTO trials (trial_id, run_id, task_id, task_version, trial_index, "
+        "dispatch_order, cost_cap_usd, state, source_trial_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?)",
+        [
+            (
+                str(uuid.uuid4()),
+                run_id,
+                trial.task_id,
+                trial.task_version,
+                trial.trial_index,
+                trial.dispatch_order,
+                trial.cost_cap_usd,
+                trial.source_trial_id,
+            )
+            for trial in trials
+        ],
+    )
 
 
 def _save_config(conn: sqlite3.Connection, config: AgentConfig) -> str:

@@ -51,6 +51,7 @@ FIELDS = frozenset(
         "judge_model",
         "review_rate",
         "filter",
+        "top_up",
     }
 )
 MAX_TRIALS = 1000
@@ -58,6 +59,7 @@ MAX_CONCURRENCY = 64
 MAX_TASKS = 1000
 MAX_LABELS = 20
 MAX_TEXT = 200
+MAX_TOP_UP = 20
 
 
 @dataclass
@@ -180,6 +182,7 @@ def parse_request(body: dict[str, Any], configs_dir: Path) -> RunRequest:
         judge_model=judge_model,
         review_rate=float(review_rate),
         task_filter=_task_filter(body.get("filter", {})),
+        top_up=_top_up(body.get("top_up", 0)),
     )
 
 
@@ -211,6 +214,12 @@ def _task_filter(spec: Any) -> TaskFilter:
     ):
         raise _bad("filter.failed_in must be a run id")
     return TaskFilter(values["tags"], values["categories"], values["difficulties"], failed_in)
+
+
+def _top_up(value: Any) -> int:
+    if not (_is_int(value) and 0 <= value <= MAX_TOP_UP):
+        raise _bad(f"top_up must be an integer from 0 to {MAX_TOP_UP}")
+    return value
 
 
 def _bounded_int(body: dict[str, Any], name: str, default: int, maximum: int) -> int:

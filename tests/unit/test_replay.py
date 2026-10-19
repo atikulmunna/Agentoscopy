@@ -10,7 +10,7 @@ from conftest import BASE_TASK, running_gateway
 
 from agentoscopy.cli.main import main
 from agentoscopy.recorder.trajectory import TrajectoryRecorder, read_events
-from agentoscopy.replay import RecordedCall, load_recording, request_hash
+from agentoscopy.replay import Playback, RecordedCall, load_recording, request_hash
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.spec import Budget, load_task
 from agentoscopy.storage.store import Store
@@ -154,7 +154,9 @@ def test_a_recorded_error_is_answered_again(tmp_path):
     async def scenario():
         async with running_gateway() as gateway:
             recorder = TrajectoryRecorder(tmp_path / "t.jsonl", tmp_path / "a", "t", 1)
-            session = gateway.open_session("t", Budget(), recorder, "s", replay=recording)
+            session = gateway.open_session(
+                "t", Budget(), recorder, "s", playback=Playback(tuple(recording))
+            )
             client = anthropic.AsyncAnthropic(
                 base_url=session.endpoint.base_url, api_key=session.endpoint.token
             )

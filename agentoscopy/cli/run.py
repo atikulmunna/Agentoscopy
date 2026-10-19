@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from agentoscopy.cli.common import (
     DB_NAME,
@@ -24,6 +26,7 @@ from agentoscopy.launch import (
     LaunchError,
     PreparedRun,
     RunRequest,
+    create_fork,
     create_replay,
     create_run,
     execute_run,
@@ -91,42 +94,81 @@ def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) 
 
 def replay_command(args: argparse.Namespace) -> int:
     """`agentoscopy replay <trial_id>`: rerun a trial against its recorded model calls."""
-    proxy, failure = start_proxy()  # judges grade the replay live
+    return _from_recorded_trial(
+        args,
+        lambda store, dirs, credentials: create_replay(
+            store, dirs, args.trial_id, has_credentials=credentials
+        ),
+        _replay_verdict,
+    )
+
+
+def fork_command(args: argparse.Namespace) -> int:
+    """`agentoscopy fork <trial_id> --at-step N`: replay up to step N, then go live."""
+    return _from_recorded_trial(
+        args,
+        lambda store, dirs, credentials: create_fork(
+            store,
+            dirs,
+            args.trial_id,
+            args.at_step,
+            agent=args.agent,
+            inject=args.inject,
+            has_credentials=credentials,
+        ),
+        _fork_verdict,
+    )
+
+
+def _from_recorded_trial(
+    args: argparse.Namespace,
+    create: Callable[[Store, Directories, bool], PreparedRun],
+    verdict: Callable[[dict[str, Any], dict[str, Any]], int],
+) -> int:
+    proxy, failure = start_proxy()  # judges grade live, and a fork calls models live
     if failure is not None:
         return failure
     store = Store(args.home / DB_NAME)
     try:
         dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
         try:
-            prepared = create_replay(store, dirs, args.trial_id, has_credentials=proxy is not None)
+            prepared = create(store, dirs, proxy is not None)
         except LaunchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_INVALID_INPUT
         status = execute_with_progress(store, prepared, args.home, proxy)
         if status != "completed":
             return EXIT_BY_STATUS.get(status, EXIT_ENVIRONMENT)
-        return _replay_verdict(store, prepared.run_id, args.trial_id)
+        (rerun,) = store.trial_rows(prepared.run_id)
+        if rerun["error_code"] == "REPLAY_DIVERGED":
+            print(f"FAIL {rerun['error']}; see trial {rerun['trial_id']}")
+            return EXIT_CHECK_FAILED
+        return verdict(rerun, store.get_trial(args.trial_id))
     finally:
         store.close()
         if proxy:
             proxy.stop()
 
 
-def _replay_verdict(store: Store, run_id: str, source_id: str) -> int:
-    (replayed,) = store.trial_rows(run_id)
-    source = store.get_trial(source_id)
-    if replayed["error_code"] == "REPLAY_DIVERGED":
-        print(f"FAIL {replayed['error']}; see trial {replayed['trial_id']}")
-        return EXIT_CHECK_FAILED
+def _replay_verdict(replayed: dict[str, Any], source: dict[str, Any]) -> int:
     print(
         f"replay {replayed['trial_id']}: {replayed['outcome']} after {replayed['steps']} model "
-        f"calls; original {source_id}: {source['outcome']} after {source['steps']}"
+        f"calls; original {source['trial_id']}: {source['outcome']} after {source['steps']}"
     )
     if (replayed["outcome"], replayed["steps"]) == (source["outcome"], source["steps"]):
         print("reproduced: same outcome from the same model calls")
         return EXIT_OK
     print("FAIL not reproduced: the replay ended differently")
     return EXIT_CHECK_FAILED
+
+
+def _fork_verdict(fork: dict[str, Any], source: dict[str, Any]) -> int:
+    print(
+        f"fork {fork['trial_id']}: {fork['outcome']} after {fork['steps']} model calls; "
+        f"original {source['trial_id']}: {source['outcome']} after {source['steps']}"
+    )
+    print(f"side by side in the web UI: #/side/{source['trial_id']}/{fork['trial_id']}")
+    return EXIT_OK
 
 
 def run_request(args: argparse.Namespace, extra_labels: dict[str, str] | None = None) -> RunRequest:
@@ -150,6 +192,7 @@ def run_request(args: argparse.Namespace, extra_labels: dict[str, str] | None = 
         judge_model=args.judge_model,
         review_rate=args.review_rate,
         task_filter=task_filter,
+        top_up=getattr(args, "top_up", 0) or 0,
     )
 
 
@@ -164,7 +207,7 @@ def execute_with_progress(
     """Execute a prepared run with live progress. Returns its final status, or None after a
     harness failure (reported on stderr)."""
     settings = prepared.settings
-    if not resumed and prepared.replay is None:
+    if not resumed and prepared.playback is None:
         estimate = estimate_cost(
             store, prepared.pinned, config_hash(prepared.config), settings.trials_per_task
         )
@@ -174,8 +217,11 @@ def execute_with_progress(
         print(f"estimated cost ${estimate:.2f}, budget {budget_text}{truncation}")
     finished, total = store.progress(prepared.run_id)
     action = f"resuming at {finished} of {total} trials" if resumed else f"{total} trials"
-    if prepared.replay is not None:
-        action = f"replaying {len(prepared.replay)} recorded model calls"
+    playback = prepared.playback
+    if playback is not None and playback.fork_at is None:
+        action = f"replaying {len(playback.recording)} recorded model calls"
+    elif playback is not None:
+        action = f"replaying {playback.fork_at - 1} recorded model calls, then live"
     print(
         f"run {prepared.run_id}: {action}, concurrency {settings.concurrency}, "
         f"seed {settings.seed}",

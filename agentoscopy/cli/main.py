@@ -28,7 +28,7 @@ from agentoscopy.cli.common import (
     all_task_ids,
 )
 from agentoscopy.cli.manage import cancel_command, gc_command
-from agentoscopy.cli.run import replay_command, run_command, start_proxy
+from agentoscopy.cli.run import fork_command, replay_command, run_command, start_proxy
 from agentoscopy.cli.validate import validate_command
 from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
 from agentoscopy.reporting import NotFound, comparison, run_summary
@@ -110,6 +110,12 @@ def _parser() -> argparse.ArgumentParser:
     selecting.add_argument(
         "--failed-in", metavar="RUN_ID", help="only tasks that failed in this run"
     )
+    run.add_argument(
+        "--top-up",
+        type=_positive_int,
+        metavar="N",
+        help="then N more trials for each task whose results were mixed (FR-RUN-10)",
+    )
     run.set_defaults(handler=run_command)
 
     replay = commands.add_parser(
@@ -117,6 +123,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("trial_id")
     replay.set_defaults(handler=replay_command)
+
+    fork = commands.add_parser(
+        "fork", parents=[common], help="replay a trial up to a step, then go live (WF-11)"
+    )
+    fork.add_argument("trial_id")
+    fork.add_argument(
+        "--at-step",
+        type=_positive_int,
+        required=True,
+        metavar="N",
+        help="the first model call made live; earlier ones come from the recording",
+    )
+    fork.add_argument(
+        "--agent", type=Path, help="agent config to continue with (default: the original)"
+    )
+    fork.add_argument("--inject", metavar="TEXT", help="a message added at step N")
+    fork.set_defaults(handler=fork_command)
 
     cancel = commands.add_parser("cancel", parents=[common], help="cancel a run (WF-12)")
     cancel.add_argument("run_id")

@@ -21,7 +21,7 @@ class NotFound(Exception):
 def run_summary(store: Store, run_id: str, *, refresh: bool = False) -> dict[str, Any]:
     """The stored summary, or a freshly computed one (always fresh for unfinished runs).
 
-    Judge calibration changes as reviews come in, so its warnings are always computed fresh.
+    Judge calibration and failure tags change as reviewers work, so both are always fresh.
     """
     run = _run(store, run_id)
     stored = None if refresh or not run["finished_at"] else store.get_summary(run_id)
@@ -36,7 +36,11 @@ def run_summary(store: Store, run_id: str, *, refresh: bool = False) -> dict[str
             task_specs=store.task_specs_for_run(run_id),
         )
         summary["judge_cost_usd"] = store.run_judge_spent(run_id)
-    return {**summary, "uncalibrated_judges": _uncalibrated_judges(store, run_id)}
+    return {
+        **summary,
+        "uncalibrated_judges": _uncalibrated_judges(store, run_id),
+        "failure_tags": store.failure_tag_counts(run_id),  # reviewers keep adding them
+    }
 
 
 def comparison(

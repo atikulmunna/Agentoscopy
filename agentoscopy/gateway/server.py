@@ -25,7 +25,13 @@ from agentoscopy.gateway.pricing import Price, is_mock, price_for
 from agentoscopy.gateway.session import BudgetExhausted, TrialSession
 from agentoscopy.gateway.sse import MessageAccumulator
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
-from agentoscopy.replay import REPLAY_DIVERGED_ERROR, RecordedCall, request_hash
+from agentoscopy.replay import (
+    REPLAY_DIVERGED_ERROR,
+    Playback,
+    missing_tools,
+    request_hash,
+    with_injection,
+)
 from agentoscopy.spec import Budget
 
 UPSTREAM_ATTEMPTS = 4
@@ -89,13 +95,13 @@ class Gateway:
         budget: Budget,
         recorder: TrajectoryRecorder,
         seed_key: str,
-        replay: list[RecordedCall] | None = None,
+        playback: Playback | None = None,
     ) -> TrialSession:
-        """A trial's session. With `replay`, model calls are answered from that recording."""
+        """A trial's session. With `playback`, model calls are answered from a recording."""
         token = "agt-" + secrets.token_urlsafe(32)
         recorder.add_secret(token)
         session = TrialSession(trial_id, token, self.base_url, budget, recorder, seed_key)
-        session.replay = replay
+        session.playback = playback
         self._sessions[token] = session
         return session
 
@@ -133,9 +139,12 @@ class Gateway:
             )
             return _error(400, BUDGET_EXCEEDED_ERROR, f"Agentoscopy trial budget: {exc}")
         call_index = session.start_call()
+        playback = session.playback
+        if playback and playback.inject and call_index == playback.fork_at:
+            body = with_injection(body, playback.inject)
         _record_request(session, call_index, body, requested)
-        if session.replay is not None:
-            return await _serve_replay(request, session, call_index, body, requested)
+        if playback is not None and playback.answers(call_index):
+            return await _serve_playback(request, session, call_index, body, requested)
         if is_mock(body["model"]):
             return await self._serve_mock(request, session, call_index, body, price)
         return await self._serve_upstream(request, session, call_index, body, price)
@@ -271,23 +280,29 @@ async def _relay_error(
     return web.Response(status=upstream.status, body=data, content_type="application/json")
 
 
-async def _serve_replay(
+async def _serve_playback(
     request: web.Request,
     session: TrialSession,
     call_index: int,
     body: dict[str, Any],
     requested_max_tokens: int,
 ) -> web.StreamResponse:
-    """Answer from the recording, if the agent sent the request that was recorded."""
-    recording = session.replay or []
+    """Answer from the recording. A replay requires the request that was recorded; a fork
+    requires only that the recorded answer calls tools this config still offers."""
+    playback = session.playback
+    recording = playback.recording if playback else ()
     recorded = recording[call_index - 1] if call_index <= len(recording) else None
     sent = {**body, "max_tokens": requested_max_tokens}
-    if recorded is None or recorded.request_hash != request_hash(sent):
-        why = (
-            "the source trial made no model call at this step"
-            if recorded is None
-            else "the request differs from the one recorded at this step"
-        )
+    why = None
+    if recorded is None:
+        why = "the source trial made no model call at this step"
+    elif playback.fork_at is None and recorded.request_hash != request_hash(sent):
+        why = "the request differs from the one recorded at this step"
+    elif playback.fork_at is not None and recorded.status == 200:
+        missing = missing_tools(recorded.response, body)
+        if missing:
+            why = f"the recorded answer calls {', '.join(missing)}, which this config lacks"
+    if why:
         session.replay_divergence = f"step {call_index}: {why}"
         message = f"REPLAY_DIVERGED at {session.replay_divergence}"
         session.recorder.write("error", {"source": "gateway", "message": message})

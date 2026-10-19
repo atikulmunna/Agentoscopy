@@ -290,3 +290,30 @@ def test_a_replay_reproduces_a_recorded_trial(tmp_path, capsys):
         assert leftovers("ps", replayed["trial_id"]) == ""
     finally:
         store.close()
+
+
+def test_a_fork_goes_live_from_its_step(tmp_path, capsys):
+    """M5 exit criterion (part two): a fork of a recorded trial, linked to it for the
+    side-by-side view."""
+    common = ["--home", str(tmp_path / "home"), "--tasks-dir", str(REPO / "tasks")]
+    judged = [*common, "--judge-model", "mock"]
+    agent = str(REPO / "configs" / "scripted-fix.yaml")
+    assert main(["task", "validate", TASK_ID, *judged]) == 0
+    assert main(["run", "--task", TASK_ID, "--agent", agent, "--trials", "1", *judged]) == 0
+    store = Store(tmp_path / "home" / "agentoscopy.db")
+    try:
+        (source,) = store.trial_rows(store.list_runs()[0]["run_id"])
+        capsys.readouterr()
+
+        fork_args = ["fork", source["trial_id"], "--at-step", "2", "--inject", "Be brief."]
+        assert main([*fork_args, *common]) == 0
+
+        assert f"#/side/{source['trial_id']}/" in capsys.readouterr().out
+        fork_run = store.list_runs()[0]
+        (fork,) = store.trial_rows(fork_run["run_id"])
+        assert (fork_run["mode"], fork["source_trial_id"]) == ("fork", source["trial_id"])
+        assert fork["outcome"] == "pass" and fork["steps"] == source["steps"]
+        assert 0 < fork["cost_usd"] < source["cost_usd"]  # step 1 replayed free, step 2 paid
+        assert leftovers("ps", fork["trial_id"]) == ""
+    finally:
+        store.close()

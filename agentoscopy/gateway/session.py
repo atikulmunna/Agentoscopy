@@ -8,7 +8,7 @@ from typing import Any
 from agentoscopy.adapters.base import ModelEndpoint
 from agentoscopy.gateway.pricing import Price, cost_usd
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
-from agentoscopy.replay import RecordedCall
+from agentoscopy.replay import Playback
 from agentoscopy.spec import Budget
 
 
@@ -44,7 +44,7 @@ class TrialSession:
     backoff_s: float = 0.0  # extends the trial deadline (FR-EXE-03)
     exhausted: str | None = None  # budget dimension that stopped the agent, if any
     provider_error: str | None = None  # set when the provider stays unavailable (WF-04 E3)
-    replay: list[RecordedCall] | None = field(default=None, repr=False)  # replay mode
+    playback: Playback | None = field(default=None, repr=False)  # replay or fork
     replay_divergence: str | None = None  # where a replay stopped matching (FR-RPL-02)
 
     @property

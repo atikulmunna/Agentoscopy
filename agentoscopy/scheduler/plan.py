@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from agentoscopy.gateway.pricing import is_mock, price_for
 from agentoscopy.spec import Task, TaskSpec, load_task
@@ -124,6 +126,38 @@ def check_judge(tasks: list[Task], judge_model: str, has_credentials: bool) -> s
             "(or pass a mock judge model)"
         )
     return judge_model
+
+
+def top_up_trials(
+    trial_rows: list[dict[str, Any]], pinned: list[PinnedTask], extra: int
+) -> list[NewTrial]:
+    """`extra` more trials for every task whose scored trials both passed and failed
+    (FR-RUN-10): statistical power goes where the result is uncertain. They are dispatched
+    round-robin, after everything planned."""
+    by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in trial_rows:
+        by_task[row["task_id"]].append(row)
+    mixed = [
+        item
+        for item in pinned
+        if {"pass", "fail"} <= {row["outcome"] for row in by_task[item.task.spec.id]}
+    ]
+    order = max((row["dispatch_order"] for row in trial_rows), default=-1) + 1
+    trials = []
+    for round_index in range(extra):
+        for item in mixed:
+            rows = by_task[item.task.spec.id]
+            trials.append(
+                NewTrial(
+                    task_id=item.task.spec.id,
+                    task_version=item.version,
+                    trial_index=max(row["trial_index"] for row in rows) + 1 + round_index,
+                    dispatch_order=order,
+                    cost_cap_usd=item.task.spec.budget.max_cost_usd,
+                )
+            )
+            order += 1
+    return trials
 
 
 def plan_trials(pinned: list[PinnedTask], trials_per_task: int, seed: int) -> list[NewTrial]:

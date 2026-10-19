@@ -258,6 +258,7 @@ function errorState(error) {
 
 function runName(run) {
   if (run.mode === "replay") return "Replay";
+  if (run.mode === "fork") return "Fork";
   if (!run.suite_id) return "Ad hoc tasks";
   return run.suite_version == null ? `${run.suite_id}, filtered` : `${run.suite_id} v${run.suite_version}`;
 }
@@ -409,6 +410,16 @@ async function runView(runId) {
     wellLegend(),
     table(["Task", "Trials", "Pass rate", "Passes", `pass@${k}`, `pass^${k}`, "Cost per trial", "Steps"], taskRows, [3, 4, 5, 6, 7]),
     sliceSections(summary.slices, "Mean pass rate", (value) => h("span", { class: "bar-cell" }, magnitude(value), pct(value))),
+    tagCounts(summary.failure_tags),
+  ];
+}
+
+function tagCounts(counts) {
+  const entries = Object.entries(counts || {});
+  if (!entries.length) return null;
+  return [
+    h("h2", {}, "Failure tags"),
+    table(["Tag", "Trials"], entries.map(([tag, n]) => h("tr", {}, h("td", {}, tag.replaceAll("_", " ")), h("td", { class: "num" }, String(n)))), [1]),
   ];
 }
 
@@ -643,7 +654,7 @@ async function trialView(trialId) {
       h("a", { href: `#/runs/${enc(trial.run_id)}` }, shortId(trial.run_id)),
       trial.source_trial_id
         ? [
-            ", a replay of trial ",
+            trial.run_mode === "fork" ? `, a fork at step ${trial.run_labels.fork_at} of trial ` : ", a replay of trial ",
             h("a", { href: `#/trials/${enc(trial.source_trial_id)}` }, shortId(trial.source_trial_id)),
             " (",
             h("a", { href: `#/side/${enc(trial.source_trial_id)}/${enc(trial.trial_id)}` }, "side by side"),
@@ -653,9 +664,7 @@ async function trialView(trialId) {
       trial.attempt > 1 ? `. Attempt ${trial.attempt}; earlier attempts ended in infra errors and were retried.` : ".",
     ),
     h("div", { class: "facts" }, facts.map(([label, value]) => h("span", {}, `${label} `, h("b", {}, String(value))))),
-    trial.failure_tags.length
-      ? h("div", { class: "tags" }, h("span", { class: "muted" }, "Failure tags"), trial.failure_tags.map((tag) => h("span", { class: "class-tag", title: `Added by ${tag.source}` }, tag.tag.replaceAll("_", " "))))
-      : null,
+    tagSection(trial),
     trial.error_code ? h("div", { class: "notice" }, h("strong", {}, trial.error_code), " ", trial.error) : null,
     vetoed
       ? h(
@@ -670,6 +679,54 @@ async function trialView(trialId) {
     reviewable ? h("div", { class: "toolbar" }, queueButton(trial.trial_id, null, "Add to review queue")) : null,
     tabs,
   ];
+}
+
+function tagSection(trial) {
+  const failed = trial.outcome === "fail";
+  if (!failed && !trial.failure_tags.length) return null;
+  const chips = h("span", { class: "tags" });
+  const status = h("span", { class: "muted", role: "status" });
+  async function change(method, path, body) {
+    try {
+      draw((await api(path, { method, body })).failure_tags);
+      status.textContent = "";
+    } catch (error) {
+      status.textContent = sentence(error.message);
+    }
+  }
+  function draw(tags) {
+    chips.replaceChildren(
+      ...tags.map((tag) => {
+        const by = tag.source === "human" ? "a reviewer" : "the harness";
+        const chip = h("span", { class: "class-tag", title: tag.note ? `${tag.note} (added by ${by})` : `Added by ${by}` }, tag.tag.replaceAll("_", " "));
+        if (tag.source === "human" && failed) {
+          const remove = h("button", { type: "button", class: "chip-remove", "aria-label": `Remove the tag ${tag.tag}` }, "\u00d7");
+          remove.addEventListener("click", () => change("DELETE", `/trials/${enc(trial.trial_id)}/tags/${enc(tag.tag)}`));
+          chip.append(remove);
+        }
+        return chip;
+      }),
+    );
+    if (!tags.length) chips.append(h("span", { class: "muted" }, "none yet"));
+  }
+  draw(trial.failure_tags);
+  if (!failed) return h("div", { class: "tags" }, h("span", { class: "muted" }, "Failure tags"), chips);
+  const options = h("datalist", { id: "failure-tags" });
+  api("/failure-tags")
+    .then(({ taxonomy }) => options.replaceChildren(...taxonomy.map((item) => h("option", { value: item.tag }, item.description))))
+    .catch(() => {}); // free-form tags still work without suggestions
+  const input = h("input", { type: "text", list: "failure-tags", placeholder: "Add a tag", "aria-label": "Failure tag", maxlength: 40 });
+  const add = h("button", { type: "button" }, "Add");
+  const submit = () => {
+    if (!input.value.trim()) return;
+    change("POST", `/trials/${enc(trial.trial_id)}/tags`, { tag: input.value });
+    input.value = "";
+  };
+  add.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+  });
+  return h("div", { class: "tags" }, h("span", { class: "muted" }, "Failure tags"), chips, input, options, add, status);
 }
 
 function judgeDetails(metadata = {}) {
