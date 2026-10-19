@@ -8,6 +8,7 @@ The well-behaved, broken, and malicious test agents are all configs for this one
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from anthropic import AsyncAnthropic, BadRequestError
 from pydantic import BaseModel, ConfigDict, Field
@@ -85,14 +86,7 @@ class ScriptedAgent:
             raise RuntimeError("setup() must run before run()")
         client = AsyncAnthropic(base_url=model_endpoint.base_url, api_key=model_endpoint.token)
         try:
-            for action in self._params.script:
-                if isinstance(action, SleepAction):
-                    await asyncio.sleep(action.sleep)
-                elif isinstance(action, ModelCallsAction):
-                    if not await _call_model(client, self._params.model, action):
-                        break  # budget spent: stop, as a real agent would
-                else:
-                    await _perform(action, sandbox)
+            await _play(self._params, client, sandbox)
         finally:
             await client.close()
         recorder.event("agent_message", text=self._params.final_message)
@@ -100,6 +94,17 @@ class ScriptedAgent:
 
     async def teardown(self) -> None:
         self._params = None
+
+
+async def _play(params: ScriptParams, client: AsyncAnthropic, sandbox: Sandbox) -> None:
+    for action in params.script:
+        if isinstance(action, SleepAction):
+            await asyncio.sleep(action.sleep)
+        elif isinstance(action, ModelCallsAction):
+            if not await _call_model(client, params.model, action):
+                return  # budget spent: stop, as a real agent would
+        else:
+            await _perform(action, sandbox)
 
 
 async def _call_model(client: AsyncAnthropic, model: str, action: ModelCallsAction) -> bool:
@@ -111,16 +116,20 @@ async def _call_model(client: AsyncAnthropic, model: str, action: ModelCallsActi
     }
     for _ in range(action.model_calls):
         try:
-            if action.stream:
-                async with client.messages.stream(**request) as stream:
-                    await stream.get_final_message()
-            else:
-                await client.messages.create(**request)
+            await _send(client, request, action.stream)
         except BadRequestError as exc:
             if exc.type != BUDGET_EXCEEDED_ERROR:
                 raise
             return False
     return True
+
+
+async def _send(client: AsyncAnthropic, request: dict[str, Any], stream: bool) -> None:
+    if not stream:
+        await client.messages.create(**request)
+        return
+    async with client.messages.stream(**request) as response:
+        await response.get_final_message()
 
 
 async def _perform(action: ExecAction | WriteAction | ReadAction, sandbox: Sandbox) -> None:

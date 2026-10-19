@@ -16,8 +16,15 @@ DURATION_BUCKETS = (10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0)
 
 def render_metrics(store: Store) -> str:
     data = store.metrics(DURATION_BUCKETS)
-    states = data["trial_states"]
     lines: list[str] = []
+    _work_families(lines, data)
+    _timing_and_spend_families(lines, data)
+    return "\n".join(lines) + "\n"
+
+
+def _work_families(lines: list[str], data: dict[str, Any]) -> None:
+    """Queue depth, trials in flight, and counts of runs, trials, and attempts."""
+    states = data["trial_states"]
     _family(
         lines,
         "queue_depth",
@@ -54,6 +61,9 @@ def render_metrics(store: Store) -> str:
         "Attempts that ended in an infra error, by error code.",
         _by(data["infra_errors"], "error_code"),
     )
+
+
+def _timing_and_spend_families(lines: list[str], data: dict[str, Any]) -> None:
     _histogram(lines, data["durations"])
     _family(
         lines,
@@ -74,7 +84,6 @@ def render_metrics(store: Store) -> str:
             ({"kind": "judge"}, data["judge_spend_usd"]),
         ],
     )
-    return "\n".join(lines) + "\n"
 
 
 def _family(

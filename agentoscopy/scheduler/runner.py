@@ -86,7 +86,6 @@ class RunExecutor:
         self._backend = backend
         self._gateway = gateway
         self._output_root = output_root
-        self._concurrency = concurrency
         self._seed = seed
         self._adapter_factory = adapter_factory
         self._on_progress = on_progress

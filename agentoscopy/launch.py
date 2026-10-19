@@ -6,10 +6,11 @@ import secrets
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
+from typing import Any
 
 from agentoscopy.adapters.python import AdapterLoadError, load_python_adapter
 from agentoscopy.gateway.server import Gateway
-from agentoscopy.replay import Playback, load_recording
+from agentoscopy.replay import Playback, RecordedCall, load_recording
 from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.base import SandboxBackend
 from agentoscopy.scheduler.plan import (
@@ -242,27 +243,8 @@ def _from_recorded_trial(
     if trial is None:
         raise LaunchError(f"NOT_FOUND: no trial {trial_id}")
     source = store.get_run(trial["run_id"])
-    trajectory, artifacts = attempt_paths(dirs.home, source["run_id"], trial_id, trial["attempt"])
-    recording = load_recording(trajectory, artifacts) if trajectory.is_file() else []
-    if not recording:
-        raise LaunchError(f"NO_RECORDING: trial {trial_id} has no recorded model calls")
-    if fork_at is not None and not 1 <= fork_at <= len(recording) + 1:
-        raise LaunchError(
-            f"FORK_STEP_OUT_OF_RANGE: trial {trial_id} recorded {len(recording)} model calls, "
-            f"so a fork can start at step 1 to {len(recording) + 1}"
-        )
-    versions = {v.task_id: v for v in store.run_task_versions(source["run_id"])}
-    try:
-        pinned = _repin(dirs.tasks, versions[trial["task_id"]])
-        if agent is not None:
-            config = load_agent_config(agent)
-        else:
-            config = AgentConfig.model_validate(store.config_spec(source["config_hash"]))
-        load_python_adapter(config.entrypoint)
-        if source["judge_model"]:
-            check_judge([pinned.task], source["judge_model"], has_credentials)
-    except (SpecError, PlanError, AdapterLoadError) as exc:
-        raise LaunchError(str(exc)) from exc
+    recording = _recording(dirs.home, trial, fork_at)
+    pinned, config = _task_and_config(store, dirs, source, trial["task_id"], agent, has_credentials)
     settings = RunSettings(
         suite_id=None,
         suite_version=None,
@@ -287,6 +269,45 @@ def _from_recorded_trial(
     run_id = store.create_run(config, settings, [new_trial])
     playback = Playback(tuple(recording), fork_at, inject)
     return PreparedRun(run_id, [pinned], config, settings, playback)
+
+
+def _recording(home: Path, trial: dict[str, Any], fork_at: int | None) -> list[RecordedCall]:
+    """The model calls the trial's final attempt recorded, checked against the fork step."""
+    trial_id = trial["trial_id"]
+    trajectory, artifacts = attempt_paths(home, trial["run_id"], trial_id, trial["attempt"])
+    recording = load_recording(trajectory, artifacts) if trajectory.is_file() else []
+    if not recording:
+        raise LaunchError(f"NO_RECORDING: trial {trial_id} has no recorded model calls")
+    if fork_at is not None and not 1 <= fork_at <= len(recording) + 1:
+        raise LaunchError(
+            f"FORK_STEP_OUT_OF_RANGE: trial {trial_id} recorded {len(recording)} model calls, "
+            f"so a fork can start at step 1 to {len(recording) + 1}"
+        )
+    return recording
+
+
+def _task_and_config(
+    store: Store,
+    dirs: Directories,
+    source: dict[str, Any],
+    task_id: str,
+    agent: Path | None,
+    has_credentials: bool,
+) -> tuple[PinnedTask, AgentConfig]:
+    """The source run's pinned task, and its agent config or the one given instead."""
+    versions = {v.task_id: v for v in store.run_task_versions(source["run_id"])}
+    try:
+        pinned = _repin(dirs.tasks, versions[task_id])
+        if agent is not None:
+            config = load_agent_config(agent)
+        else:
+            config = AgentConfig.model_validate(store.config_spec(source["config_hash"]))
+        load_python_adapter(config.entrypoint)
+        if source["judge_model"]:
+            check_judge([pinned.task], source["judge_model"], has_credentials)
+    except (SpecError, PlanError, AdapterLoadError) as exc:
+        raise LaunchError(str(exc)) from exc
+    return pinned, config
 
 
 def _repin(tasks_dir: Path, pinned_version: TaskVersion) -> PinnedTask:

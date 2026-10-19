@@ -18,7 +18,7 @@ from agentoscopy.gateway.session import TrialSession, Usage
 from agentoscopy.graders.base import GraderError, GradeResult
 from agentoscopy.graders.fsdiff import since_baseline
 from agentoscopy.graders.judge import GatewayJudge
-from agentoscopy.graders.pipeline import grade_snapshot
+from agentoscopy.graders.pipeline import GradingOutcome, grade_snapshot
 from agentoscopy.recorder.trajectory import TrajectoryRecorder, read_events
 from agentoscopy.replay import Playback
 from agentoscopy.sandbox.base import ManagedSandbox, SandboxBackend, SandboxError
@@ -109,6 +109,20 @@ class _Resources:
     judge: GatewayJudge | None = None
 
 
+@dataclass(frozen=True)
+class _Attempt:
+    """Everything one attempt works with."""
+
+    spec: AttemptSpec
+    adapter: AgentAdapter
+    backend: SandboxBackend
+    gateway: Gateway
+    recorder: TrajectoryRecorder
+    resources: _Resources
+    on_state: StateCallback
+    cancel: asyncio.Event
+
+
 @dataclass
 class _Outcome:
     outcome: str
@@ -139,36 +153,41 @@ async def run_attempt(
     trajectory_path, artifacts_dir = attempt_paths(
         output_root, spec.run_id, spec.trial_id, spec.attempt
     )
-    recorder = TrajectoryRecorder(trajectory_path, artifacts_dir, spec.trial_id, spec.attempt)
-    resources = _Resources()
-    started = time.monotonic()
+    attempt = _Attempt(
+        spec,
+        adapter,
+        backend,
+        gateway,
+        TrajectoryRecorder(trajectory_path, artifacts_dir, spec.trial_id, spec.attempt),
+        _Resources(),
+        on_state or _ignore_state,
+        cancel or asyncio.Event(),
+    )
     try:
-        recorder.write("trial_start", _start_payload(spec))
-        try:
-            outcome = await _execute(
-                spec,
-                adapter,
-                backend,
-                gateway,
-                recorder,
-                resources,
-                on_state or _ignore_state,
-                cancel or asyncio.Event(),
-            )
-        except AttemptCancelled:
-            outcome = _Outcome("cancelled", termination="cancelled")
-        except tuple(error_class for error_class, _ in INFRA_ERRORS) as exc:
-            outcome = _Outcome("infra_error", error_code=_error_code(exc), error=str(exc))
-        finally:
-            cleanup_errors = await _destroy(resources.sandboxes, recorder)
-        duration_s = round(time.monotonic() - started, 3)
-        usage = resources.session.usage if resources.session else Usage()
-        judge_cost = resources.judge.cost_usd if resources.judge else 0.0
-        recorder.write("trial_end", _end_payload(outcome, usage, duration_s, judge_cost))
+        return await _run_and_record(attempt)
     finally:
-        recorder.close()
-        if resources.judge:
-            resources.judge.close()
+        attempt.recorder.close()
+        if attempt.resources.judge:
+            attempt.resources.judge.close()
+
+
+async def _run_and_record(attempt: _Attempt) -> AttemptResult:
+    """Execute the attempt, turning infra failures into outcomes, and record how it ended."""
+    recorder, resources = attempt.recorder, attempt.resources
+    started = time.monotonic()
+    recorder.write("trial_start", _start_payload(attempt.spec))
+    try:
+        outcome = await _execute(attempt)
+    except AttemptCancelled:
+        outcome = _Outcome("cancelled", termination="cancelled")
+    except tuple(error_class for error_class, _ in INFRA_ERRORS) as exc:
+        outcome = _Outcome("infra_error", error_code=_error_code(exc), error=str(exc))
+    finally:
+        cleanup_errors = await _destroy(resources.sandboxes, recorder)
+    duration_s = round(time.monotonic() - started, 3)
+    usage = resources.session.usage if resources.session else Usage()
+    judge_cost = resources.judge.cost_usd if resources.judge else 0.0
+    recorder.write("trial_end", _end_payload(outcome, usage, duration_s, judge_cost))
     return AttemptResult(
         outcome=outcome.outcome,
         termination=outcome.termination,
@@ -179,71 +198,87 @@ async def run_attempt(
         cleanup_errors=cleanup_errors,
         usage=usage,
         duration_s=duration_s,
-        trajectory_path=trajectory_path,
+        trajectory_path=recorder.path,
         final_state_path=resources.final_state_path,
         vetoed=outcome.vetoed,
         judge_cost_usd=judge_cost,
     )
 
 
-async def _execute(
-    spec: AttemptSpec,
-    adapter: AgentAdapter,
-    backend: SandboxBackend,
-    gateway: Gateway,
-    recorder: TrajectoryRecorder,
-    resources: _Resources,
-    on_state: StateCallback,
-    cancel: asyncio.Event,
-) -> _Outcome:
-    task = spec.task
-    _check(cancel)
-    image = await backend.prepare_image(task)
+async def _execute(attempt: _Attempt) -> _Outcome:
+    sandbox, baseline = await _provision(attempt)
+    termination, final_message = await _run_in_session(attempt, sandbox)
+    fs_diff = since_baseline(await sandbox.diff(), baseline)
+    attempt.recorder.store_artifact("final_state.diff", fs_diff.encode())
+    attempt.resources.final_state_path = attempt.recorder.artifacts_dir / "final_state.diff"
+    await sandbox.stop()
+    attempt.on_state("GRADING")
+    graded = await _grade(attempt, sandbox, final_message, fs_diff)
+    outcome = "pass" if graded.passed else "fail"
+    return _Outcome(outcome, termination, graded.score, graded.grades, vetoed=graded.vetoed)
+
+
+async def _provision(attempt: _Attempt) -> tuple[ManagedSandbox, str]:
+    """A sandbox from the pinned image with the task's setup done, and the setup's own
+    changes, so the final diff shows only what the agent changed."""
+    spec, task = attempt.spec, attempt.spec.task
+    _check(attempt.cancel)
+    image = await attempt.backend.prepare_image(task)
     if spec.image_digest and image != spec.image_digest:
         raise TaskImageChanged(
             f"task image is {image} but validation pinned {spec.image_digest}; "
             f"re-run `agentoscopy task validate {task.spec.id}`"
         )
-    sandbox = await backend.create(image, task, spec.trial_id)
-    resources.sandboxes.append(sandbox)
+    sandbox = await attempt.backend.create(image, task, spec.trial_id)
+    attempt.resources.sandboxes.append(sandbox)
     await run_setup(sandbox, task)
     baseline = await sandbox.diff() if task.spec.environment.setup else ""
-    _check(cancel)
-    session = gateway.open_session(
-        spec.trial_id, task.spec.budget, recorder, spec.seed_key, playback=spec.playback
+    _check(attempt.cancel)
+    return sandbox, baseline
+
+
+async def _run_in_session(attempt: _Attempt, sandbox: ManagedSandbox) -> tuple[str, str | None]:
+    """Run the agent with its model calls going through a gateway session."""
+    spec = attempt.spec
+    session = attempt.gateway.open_session(
+        spec.trial_id,
+        spec.task.spec.budget,
+        attempt.recorder,
+        spec.seed_key,
+        playback=spec.playback,
     )
-    resources.session = session
-    on_state("RUNNING")
+    attempt.resources.session = session
+    attempt.on_state("RUNNING")
     try:
-        termination, final_message = await _run_agent(
-            spec, adapter, sandbox, recorder, session, cancel
+        ended = await _run_agent(
+            spec, attempt.adapter, sandbox, attempt.recorder, session, attempt.cancel
         )
     finally:
-        gateway.close_session(session)
+        attempt.gateway.close_session(session)
     if session.provider_error:
         raise ProviderError(session.provider_error)
     if session.replay_divergence:
         raise ReplayDiverged(f"REPLAY_DIVERGED at {session.replay_divergence}")
-    fs_diff = since_baseline(await sandbox.diff(), baseline)
-    recorder.store_artifact("final_state.diff", fs_diff.encode())
-    resources.final_state_path = recorder.artifacts_dir / "final_state.diff"
-    await sandbox.stop()
-    on_state("GRADING")
-    resources.judge = _judge(spec, gateway, recorder)
-    graded = await grade_snapshot(
-        backend,
+    return ended
+
+
+async def _grade(
+    attempt: _Attempt, sandbox: ManagedSandbox, final_message: str | None, fs_diff: str
+) -> GradingOutcome:
+    spec = attempt.spec
+    attempt.resources.judge = _judge(spec, attempt.gateway, attempt.recorder)
+    return await grade_snapshot(
+        attempt.backend,
         await sandbox.snapshot(),
-        task,
+        spec.task,
         spec.trial_id,
-        resources.sandboxes,
+        attempt.resources.sandboxes,
         verified=spec.verified_graders,
-        trajectory=read_events(recorder.path),
+        trajectory=read_events(attempt.recorder.path),
         final_message=final_message,
         fs_diff=fs_diff,
-        judge=resources.judge,
+        judge=attempt.resources.judge,
     )
-    outcome = "pass" if graded.passed else "fail"
-    return _Outcome(outcome, termination, graded.score, graded.grades, vetoed=graded.vetoed)
 
 
 def _judge(

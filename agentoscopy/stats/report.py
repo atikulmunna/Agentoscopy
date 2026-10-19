@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 FORMATS = ("table", "md", "json")
+DIFF_CONTEXT_CHARS = 20  # kept before the first difference when a config change is shortened
 
 
 def render(summary: dict[str, Any], run: dict[str, Any], output_format: str) -> str:
@@ -176,7 +178,7 @@ def _comparison_headline(comparison: dict[str, Any]) -> list[str]:
     ]
     lines += [f"warning: {warning}" for warning in comparison["warnings"]]
     for change in comparison["config_diff"]:
-        before, after = _short(change["baseline"]), _short(change["candidate"])
+        before, after = _from_first_difference(change["baseline"], change["candidate"])
         lines.append(f"config {change['field']}: {before} -> {after}")
     return lines
 
@@ -210,7 +212,20 @@ def _signed(value: float | None, prefix: str, digits: int) -> str:
     return f"{sign}{prefix}{abs(value):.{digits}f}"
 
 
-def _short(value: Any, limit: int = 60) -> str:
+def _from_first_difference(before: Any, after: Any, limit: int = 60) -> tuple[str, str]:
+    """Both values, shortened to start a little before they first differ: long values that
+    share their opening would otherwise look the same."""
+    texts = [_one_line(before), _one_line(after)]
+    start = max(0, len(os.path.commonprefix(texts)) - DIFF_CONTEXT_CHARS)
+    lead = "..." if start else ""
+    before_text, after_text = (_clip(lead + text[start:], limit) for text in texts)
+    return before_text, after_text
+
+
+def _one_line(value: Any) -> str:
     text = json.dumps(value) if not isinstance(value, str) else value
-    text = text.replace("\n", " ")
+    return text.replace("\n", " ")
+
+
+def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."

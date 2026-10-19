@@ -9,7 +9,7 @@ import yaml
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import BASE_TASK
 
-from agentoscopy.api.runs import RunService
+from agentoscopy.api.runs import RUNS, RunService
 from agentoscopy.api.server import create_app
 from agentoscopy.launch import Directories
 from agentoscopy.sandbox.base import ExecResult
@@ -48,12 +48,12 @@ def world(tmp_path, write_task, tasks_dir, monkeypatch):
     store.close()
 
 
-def serve(world, scenario):
+def serve(world, scenario, backend=None):
     """Run `scenario(client)` against an app that executes runs with fake sandboxes."""
     service = RunService(
         Directories(world.tasks_dir, world.tasks_dir, world.home),
         world.configs,
-        FakeBackend(grader=passes_when_fixed),
+        backend or FakeBackend(grader=passes_when_fixed),
     )
 
     async def main():
@@ -93,6 +93,28 @@ def test_a_run_started_over_http_executes_in_the_server(world):
     assert (run["labels"], run["seed"], run["total_trials"]) == ({"source": "api"}, 4, 3)
     assert {trial["outcome"] for trial in trials} == {"pass"}
     assert world.store.get_summary(created["run_id"])["counts"]["pass"] == 3
+
+
+class BrokenBackend(FakeBackend):
+    """A harness bug rather than a sandbox failure: nothing retries or records it."""
+
+    async def prepare_image(self, task):
+        raise RuntimeError("the harness broke")
+
+
+def test_a_run_the_harness_cannot_execute_is_marked_failed_and_logged(world, caplog):
+    async def scenario(client):
+        _, created = await start(client)
+        run = await wait_for(client, created["run_id"], {"failed"})
+        while client.app[RUNS].running:  # the failure is logged once execution has unwound
+            await asyncio.sleep(0.01)
+        return run
+
+    run = serve(world, scenario, backend=BrokenBackend())
+
+    failures = [r for r in caplog.records if r.name == "agentoscopy.api.runs"]
+    assert [r.getMessage() for r in failures] == [f"run {run['run_id']} failed"]
+    assert failures[0].levelname == "ERROR" and "the harness broke" in caplog.text
 
 
 @pytest.mark.parametrize(

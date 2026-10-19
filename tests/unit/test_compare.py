@@ -11,6 +11,7 @@ from agentoscopy.stats.compare import (
     mean_ci,
     t_975,
 )
+from agentoscopy.stats.report import render_ci_comment
 
 
 def run_inputs(run_id, tasks, specs=None, config=None):
@@ -189,6 +190,32 @@ def test_config_diff_reports_changed_fields_and_text_diffs():
     assert changes["params.effort"]["candidate"] is None
     assert "-two" in changes["params.system"]["diff"]
     assert "+three" in changes["params.system"]["diff"]
+
+
+def config_lines(before, after):
+    tasks = {"t": task(PASS4)}
+    result = compare_runs(
+        run_inputs("b", tasks, config=before), run_inputs("c", tasks, config=after)
+    )
+    comment = render_ci_comment(result, overridden=False, truncated=False)
+    return [line for line in comment.splitlines() if line.startswith("- config ")]
+
+
+def test_the_comment_shows_where_a_long_config_value_changed():
+    script = "def paginate(items, page, per_page):\n    start = (page - 1) * per_page\n"
+    broken = script.replace("per_page\n", "per_page + 1\n")
+
+    [line] = config_lines({"params": {"code": script}}, {"params": {"code": broken}})
+
+    before, after = line.removeprefix("- config params.code: ").split(" -> ")
+    assert before.startswith("...") and after.startswith("...")
+    assert "* per_page " in before and "* per_page + 1" in after
+
+
+def test_short_config_values_are_shown_whole():
+    assert config_lines({"params": {"model": "m1"}}, {"params": {"model": "m2"}}) == [
+        "- config params.model: m1 -> m2"
+    ]
 
 
 def test_a_config_compared_with_itself_rarely_gives_a_verdict():

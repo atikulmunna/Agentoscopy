@@ -67,7 +67,21 @@ def _parser() -> argparse.ArgumentParser:
         prog="agentoscopy", description="Evaluation harness for LLM agents."
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    _add_task_commands(commands, common)
+    _add_agent_commands(commands, common)
+    _add_run_command(commands, common, run_options)
+    _add_replay_commands(commands, common)
+    _add_upkeep_commands(commands, common)
+    _add_ci_command(commands, common, run_options)
+    _add_report_commands(commands, common)
+    _add_serve_command(commands, common)
+    return parser
 
+
+def _add_task_commands(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`task validate` and `task list`."""
     task = commands.add_parser("task", help="validate and list tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
     validate = task_commands.add_parser("validate", parents=[common], help="run WF-01 checks")
@@ -80,6 +94,11 @@ def _parser() -> argparse.ArgumentParser:
     listing = task_commands.add_parser("list", parents=[common], help="tasks and validation status")
     listing.set_defaults(handler=_list_command)
 
+
+def _add_agent_commands(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`agent check`."""
     agent = commands.add_parser("agent", help="check agent configs")
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     check = agent_commands.add_parser(
@@ -88,6 +107,13 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("config", type=Path, help="agent config YAML file")
     check.set_defaults(handler=agent_check_command)
 
+
+def _add_run_command(
+    commands: argparse._SubParsersAction,
+    common: argparse.ArgumentParser,
+    run_options: argparse.ArgumentParser,
+) -> None:
+    """`run`, with its task selection and top-up."""
     run = commands.add_parser(
         "run", parents=[common, run_options], help="run a suite or tasks with an agent"
     )
@@ -118,6 +144,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.set_defaults(handler=run_command)
 
+
+def _add_replay_commands(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`replay` and `fork` (WF-11)."""
     replay = commands.add_parser(
         "replay", parents=[common], help="rerun a trial from its recorded model calls (WF-11)"
     )
@@ -141,6 +172,11 @@ def _parser() -> argparse.ArgumentParser:
     fork.add_argument("--inject", metavar="TEXT", help="a message added at step N")
     fork.set_defaults(handler=fork_command)
 
+
+def _add_upkeep_commands(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`cancel` and `gc`."""
     cancel = commands.add_parser("cancel", parents=[common], help="cancel a run (WF-12)")
     cancel.add_argument("run_id")
     cancel.set_defaults(handler=cancel_command)
@@ -158,6 +194,13 @@ def _parser() -> argparse.ArgumentParser:
     gc.add_argument("--dry-run", action="store_true", help="report without deleting")
     gc.set_defaults(handler=gc_command)
 
+
+def _add_ci_command(
+    commands: argparse._SubParsersAction,
+    common: argparse.ArgumentParser,
+    run_options: argparse.ArgumentParser,
+) -> None:
+    """`ci` (WF-10)."""
     ci = commands.add_parser(
         "ci", parents=[common, run_options], help="run, compare with a baseline, report (WF-10)"
     )
@@ -190,6 +233,11 @@ def _parser() -> argparse.ArgumentParser:
     ci.add_argument("--pr", type=_positive_int, help="pull request number (default: this event's)")
     ci.set_defaults(handler=ci_command, tasks=None, resume=None)
 
+
+def _add_report_commands(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`report` and `compare`."""
     report = commands.add_parser("report", parents=[common], help="print a run summary")
     report.add_argument("run_id")
     report.add_argument("--format", choices=FORMATS, default="table")
@@ -206,6 +254,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     compare.set_defaults(handler=_compare_command)
 
+
+def _add_serve_command(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`serve`: the REST API and web UI."""
     serve = commands.add_parser("serve", parents=[common], help="REST API and web UI")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8321)
@@ -216,7 +269,6 @@ def _parser() -> argparse.ArgumentParser:
         help="agent configs that POST /runs may name",
     )
     serve.set_defaults(handler=_serve_command)
-    return parser
 
 
 def _run_options() -> argparse.ArgumentParser:

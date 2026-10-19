@@ -8,8 +8,8 @@ cannot point the harness at arbitrary code.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,11 +98,12 @@ class RunService:
     ) -> None:
         try:
             await execute_run(store, prepared, home, self.backend, gateway)
-        except Exception as exc:  # the run is marked failed; say why on the server's console
-            print(f"run {prepared.run_id} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        except Exception:  # the run is marked failed; say why on the server's console
+            log.exception("run %s failed", prepared.run_id)
 
 
 RUNS = web.AppKey("runs", RunService)
+log = logging.getLogger(__name__)
 
 
 def add_routes(app: web.Application, service: RunService) -> None:

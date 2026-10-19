@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import sqlite3
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ import yaml
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import BASE_TASK, running_gateway
 
-from agentoscopy.api.server import create_app
+from agentoscopy.api.server import UI_DIR, create_app
 from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.scheduler.plan import pin_tasks, plan_trials
@@ -97,6 +98,26 @@ def test_ui_shell_is_public_but_the_api_needs_the_token(world):
         status, body = call(world, "/runs", token=token)
         assert status == 401
         assert body["error"]["code"] == "UNAUTHORIZED"
+
+
+async def content_type(response):
+    return response.content_type
+
+
+def test_every_ui_module_is_served_as_javascript(world):
+    """The UI is ES modules: one that is missing, or served with another type, breaks it."""
+    modules = sorted(UI_DIR.glob("*.js"))
+    imported = {
+        name
+        for module in modules
+        for name in re.findall(r'from "\./([\w.]+)"', module.read_text(encoding="utf-8"))
+    }
+
+    assert imported and imported <= {module.name for module in modules}
+    for module in modules:
+        status, served_as = call(world, f"/ui/{module.name}", token=None, read=content_type)
+        assert status == 200
+        assert served_as in ("text/javascript", "application/javascript"), module.name
 
 
 def test_requests_for_foreign_hosts_are_refused(world):
