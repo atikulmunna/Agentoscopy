@@ -20,6 +20,7 @@ from aiohttp import web
 from agentoscopy.api.runs import RunService
 from agentoscopy.api.server import create_app
 from agentoscopy.cli.agent import agent_check_command
+from agentoscopy.cli.bisection import bisect_command
 from agentoscopy.cli.ci import ci_command
 from agentoscopy.cli.common import (
     DB_NAME,
@@ -171,6 +172,36 @@ def _add_replay_commands(
     )
     fork.add_argument("--inject", metavar="TEXT", help="a message added at step N")
     fork.set_defaults(handler=fork_command)
+    _add_bisect_command(commands, common)
+
+
+def _add_bisect_command(
+    commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`bisect`: the step where a failed trial went wrong."""
+    bisect = commands.add_parser(
+        "bisect", parents=[common], help="find the step where a failed trial went wrong"
+    )
+    bisect.add_argument("trial_id", help="a failed trial")
+    bisect.add_argument(
+        "--agent",
+        type=Path,
+        required=True,
+        help="a config that passes the task, to take over the trial at each step it tries",
+    )
+    bisect.add_argument(
+        "--trials",
+        type=_positive_int,
+        default=3,
+        help="forks per step; a step rescues the trial when most of them pass (default 3)",
+    )
+    bisect.add_argument(
+        "--budget-usd",
+        type=_positive_number,
+        default=2.0,
+        help="ceiling on live model spend across every fork (default 2)",
+    )
+    bisect.set_defaults(handler=bisect_command)
 
 
 def _add_upkeep_commands(
@@ -373,6 +404,13 @@ def _positive_int(text: str) -> int:
     value = int(text)
     if value <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _positive_number(text: str) -> float:
+    value = float(text)
+    if not value > 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
     return value
 
 
