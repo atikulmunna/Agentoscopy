@@ -135,7 +135,11 @@ trials per run (6 for tasks marked `critical`, which get those automatically). T
 verdict is `REGRESSION` when the 95% CI of the mean per-task change is below zero or a
 critical task regressed, `IMPROVEMENT` when it is above zero, and `NO_SIGNIFICANT_CHANGE`
 otherwise. The CI is a Student t interval over tasks: comparing a config with itself gives
-a different verdict about 5% of the time, which a test checks. The output also shows cost, token, step, and duration
+a different verdict about 5% of the time, which a test checks. Every critical task is
+another chance of a false alarm, so when a suite has several, a critical regression must
+survive a Holm correction across them; otherwise it is reported as a warning. With five
+critical tasks, false verdicts stay near 6% instead of rising to about 14%, which a test
+also checks. The output also shows cost, token, step, and duration
 deltas, deltas by task category and tag, and a field-level diff of the two agent configs.
 
 ## Grading
