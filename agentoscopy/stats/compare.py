@@ -112,7 +112,8 @@ def compare_runs(
     ci = mean_ci(deltas)
     if len(rows) < FEW_TASKS_WARNING:
         warnings.append(
-            f"only {len(rows)} shared tasks: the CI treats tasks as the sampling unit "
+            f"only {len(rows)} shared task{'' if len(rows) == 1 else 's'}: "
+            "the CI treats tasks as the sampling unit "
             f"and is unreliable below about {FEW_TASKS_WARNING}"
         )
     classes = defaultdict(int)

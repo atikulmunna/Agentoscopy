@@ -159,7 +159,7 @@ def test_only_shared_scored_versions_are_compared():
     }
     assert [row["task_id"] for row in with_drift["tasks"]] == ["drifted", "shared"]
     assert any("drifted: comparing version 1 with 2" in w for w in with_drift["warnings"])
-    assert any("only 1 shared tasks" in w for w in result["warnings"])
+    assert any("only 1 shared task:" in w for w in result["warnings"])
 
 
 def test_runs_without_shared_tasks_cannot_be_compared():
@@ -216,6 +216,16 @@ def test_short_config_values_are_shown_whole():
     assert config_lines({"params": {"model": "m1"}}, {"params": {"model": "m2"}}) == [
         "- config params.model: m1 -> m2"
     ]
+
+
+@pytest.mark.parametrize(
+    ("count", "phrase"), [(1, "over 1 shared task\n"), (2, "over 2 shared tasks\n")]
+)
+def test_the_comment_counts_shared_tasks_in_words(count, phrase):
+    tasks = {f"t{i}": task(PASS4) for i in range(count)}
+    result = compare_runs(run_inputs("b", tasks), run_inputs("c", tasks))
+
+    assert phrase in render_ci_comment(result, overridden=False, truncated=False)
 
 
 def test_a_config_compared_with_itself_rarely_gives_a_verdict():

@@ -163,11 +163,12 @@ def _comparison_headline(comparison: dict[str, Any]) -> list[str]:
         f"{name.replace('_', ' ')} {len(ids)}" for name, ids in comparison["excluded"].items()
     )
     deltas = comparison["metric_deltas"]
+    shared = comparison["shared_tasks"]
     lines = [
         f"{comparison['verdict']}: candidate {cand['run_id']} vs baseline {base['run_id']}",
         f"delta pass rate {_points(comparison['delta'])} "
         f"(95% CI {_points(low)} to {_points(high)}) "
-        f"over {comparison['shared_tasks']} shared tasks",
+        f"over {shared} shared task{'' if shared == 1 else 's'}",
         f"baseline {_pct(base['macro_pass_rate'])} ({base['config_name']}), "
         f"candidate {_pct(cand['macro_pass_rate'])} ({cand['config_name']})",
         f"per-trial deltas: cost {_signed(deltas['cost_usd'], '$', 4)}, "
