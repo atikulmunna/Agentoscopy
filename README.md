@@ -43,7 +43,8 @@ a change made it better or worse, and how far to trust the answer:
   verdicts are sampled for human review, with each judge's agreement measured.
 
 It is also smaller. The bundled tasks are a starter suite for exercising the harness, not a
-benchmark, and agents are Python classes that run in the harness's process. To rank models,
+benchmark, though `task import` turns fixes from your own repository's history into tasks;
+and agents are Python classes that run in the harness's process. To rank models,
 use a benchmark such as SWE-bench; for a wide range of ready-made evaluations, Inspect; to
 gate changes to one agent, Agentoscopy.
 
