@@ -3,7 +3,8 @@
 Tasks are compared only where both runs scored the same task version. A task is Regressed or
 Improved only when a one-sided Fisher's exact test says so (p < 0.05); other differences are
 Changed and never affect the verdict. The verdict comes from the 95% CI of the mean
-per-task delta, plus any critical task classified Regressed.
+per-task delta, plus any critical task whose regression survives a Holm correction across
+all the critical tasks compared.
 
 The CI is a Student t interval with tasks as the sampling unit. A percentile bootstrap over
 a suite of 20 tasks and 3 trials came out too narrow: comparing a config with itself gave a
@@ -119,8 +120,10 @@ def compare_runs(
     classes = defaultdict(int)
     for row in rows:
         classes[row["class"]] += 1
+    critical_regressions = _critical_regressions(rows)
+    warnings += _uncorrected_critical_warnings(rows, critical_regressions)
     return {
-        "verdict": _verdict(ci, rows),
+        "verdict": _verdict(ci, critical_regressions),
         "baseline": _run_header(baseline, [base_tasks[t] for t in shared]),
         "candidate": _run_header(candidate, [cand_tasks[t] for t in shared]),
         "shared_tasks": len(rows),
@@ -134,6 +137,7 @@ def compare_runs(
         "slices": slice_rates(rows, "delta", specs),
         "excluded": excluded,
         "warnings": warnings,
+        "critical_regressions": critical_regressions,
         "config_diff": config_diff(baseline.config, candidate.config),
         "tasks": rows,
     }
@@ -261,8 +265,35 @@ def _classify(base: _TaskStats, cand: _TaskStats, p_worse: float, p_better: floa
     return "stable_pass" if base.passes == base.n else "stable_fail"
 
 
-def _verdict(ci: tuple[float, float], rows: list[dict[str, Any]]) -> str:
-    if ci[1] < 0 or any(row["critical"] and row["class"] == "regressed" for row in rows):
+def _critical_regressions(rows: list[dict[str, Any]]) -> list[str]:
+    """Critical tasks whose regression holds up when every critical task is tested at once.
+
+    Each critical task is a separate chance of a false alarm, so Holm's step-down correction
+    keeps the chance of any false critical regression within ALPHA however many critical
+    tasks a suite has. With one critical task it is the plain test.
+    """
+    critical = sorted((row for row in rows if row["critical"]), key=lambda row: row["p_worse"])
+    regressed = []
+    for rank, row in enumerate(critical):
+        if row["class"] != "regressed" or row["p_worse"] >= ALPHA / (len(critical) - rank):
+            break
+        regressed.append(row["task_id"])
+    return regressed
+
+
+def _uncorrected_critical_warnings(rows: list[dict[str, Any]], regressed: list[str]) -> list[str]:
+    tested = sum(row["critical"] for row in rows)
+    return [
+        f"{row['task_id']}: a critical task that regressed on its own "
+        f"(p = {row['p_worse']:.3f}), but not by enough to fail the comparison with "
+        f"{tested} critical tasks tested together"
+        for row in rows
+        if row["critical"] and row["class"] == "regressed" and row["task_id"] not in regressed
+    ]
+
+
+def _verdict(ci: tuple[float, float], critical_regressions: list[str]) -> str:
+    if ci[1] < 0 or critical_regressions:
         return "REGRESSION"
     if ci[0] > 0:
         return "IMPROVEMENT"

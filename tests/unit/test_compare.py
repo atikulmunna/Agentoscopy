@@ -125,6 +125,45 @@ def test_a_regressed_critical_task_fails_the_comparison_alone():
 
     assert result["delta_ci_95"][1] >= 0  # the aggregate alone would not call it
     assert result["verdict"] == "REGRESSION"
+    assert result["critical_regressions"] == ["key-task"]
+
+
+def passes(count, of=6):
+    return task(["pass"] * count + ["fail"] * (of - count))
+
+
+def critical_comparison(candidate_passes):
+    """Critical tasks a, b, ... that all passed 6 of 6 in the baseline; the candidate's passes
+    per task are given. With k tested together, Holm asks for p < 0.05 / k first."""
+    names = "abcdefgh"[: len(candidate_passes)]
+    specs = {name: {"critical": True} for name in names}
+    baseline = run_inputs("b", {name: passes(6) for name in names}, specs)
+    candidate = {name: passes(count) for name, count in zip(names, candidate_passes, strict=True)}
+    return compare_runs(baseline, run_inputs("c", candidate, specs))
+
+
+def test_a_critical_regression_must_hold_up_across_all_critical_tasks():
+    result = critical_comparison([2, 6, 6])  # 6/6 to 2/6: p = 0.030, under 0.05 but not 0.05 / 3
+
+    assert result["tasks"][0]["class"] == "regressed"  # on its own
+    assert result["critical_regressions"] == []
+    assert result["verdict"] == "NO_SIGNIFICANT_CHANGE"
+    assert any(w.startswith("a: a critical task that regressed") for w in result["warnings"])
+
+
+def test_a_clear_critical_regression_survives_the_correction():
+    result = critical_comparison([0, 6, 6])  # 6/6 to 0/6: p = 0.001
+
+    assert result["critical_regressions"] == ["a"]
+    assert result["verdict"] == "REGRESSION"
+    assert not any("critical task that regressed" in w for w in result["warnings"])
+
+
+def test_the_correction_steps_down_after_the_clearest_regression():
+    # Holm, not Bonferroni: once p = 0.001 clears 0.05 / 2, p = 0.030 needs only 0.05 / 1.
+    assert critical_comparison([0, 2])["critical_regressions"] == ["a", "b"]
+    # With a third critical task, p = 0.030 must clear 0.05 / 2 at the second step, and fails.
+    assert critical_comparison([0, 2, 6])["critical_regressions"] == ["a"]
 
 
 def test_only_shared_scored_versions_are_compared():
@@ -241,6 +280,28 @@ def test_a_config_compared_with_itself_rarely_gives_a_verdict():
             for i, rate in enumerate(pass_rates)
         }
         return run_inputs(name, tasks)
+
+    verdicts = [compare_runs(noisy_run("a"), noisy_run("b"))["verdict"] for _ in range(100)]
+
+    assert sum(verdict != "NO_SIGNIFICANT_CHANGE" for verdict in verdicts) <= 10
+
+
+def test_critical_tasks_do_not_multiply_false_alarms():
+    """Acceptance criterion 6 with five critical tasks (6 trials, passing half the time, where
+    chance regressions are likeliest) among 20. Without the Holm correction, about 14% of
+    self-comparisons gave a verdict; with it, about 6%."""
+    rng = random.Random(7)
+    pass_rates = [rng.random() for _ in range(15)]
+    critical = {f"key-{i}": {"critical": True} for i in range(5)}
+
+    def noisy_run(name):
+        tasks = {
+            f"task-{i}": task(["pass" if rng.random() < rate else "fail" for _ in range(3)])
+            for i, rate in enumerate(pass_rates)
+        }
+        for task_id in critical:
+            tasks[task_id] = task(["pass" if rng.random() < 0.5 else "fail" for _ in range(6)])
+        return run_inputs(name, tasks, critical)
 
     verdicts = [compare_runs(noisy_run("a"), noisy_run("b"))["verdict"] for _ in range(100)]
 
