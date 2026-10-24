@@ -77,7 +77,7 @@ export async function compareView(baselineId, candidateId) {
       { class: "headline" },
       hero(
         "Change in pass rate",
-        points(result.delta),
+        [signed(result.delta * 100, 1), h("span", { class: "hero-unit" }, " points")],
         `95% CI ${points(low)} to ${points(high)}`,
         ciStrip(low, high, result.delta, { min: -1, max: 1, format: (v) => `${Math.round(v * 100)}` }),
       ),
