@@ -6,6 +6,7 @@ reporting their own tool calls.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
@@ -36,6 +37,11 @@ class RecordingSandbox:
             stderr=result.stderr,
         )
         return result
+
+    async def start(self, *command: str) -> asyncio.subprocess.Process:
+        # Plumbing such as the model-call relay, not an agent action, so it is not recorded;
+        # what the process does through the gateway is.
+        return await self._inner.start(*command)
 
     async def read_file(self, path: str) -> bytes:
         started = self._record_call("read_file", {"path": path})

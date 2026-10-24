@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-from agentoscopy.adapters.base import AgentAdapter, TaskContext
+from agentoscopy.adapters.base import AgentAdapter, TaskContext, image_steps
 from agentoscopy.gateway.server import Gateway
 from agentoscopy.gateway.session import TrialSession, Usage
 from agentoscopy.graders.base import GraderError, GradeResult
@@ -229,6 +229,9 @@ async def _provision(attempt: _Attempt) -> tuple[ManagedSandbox, str]:
             f"task image is {image} but validation pinned {spec.image_digest}; "
             f"re-run `agentoscopy task validate {task.spec.id}`"
         )
+    steps = image_steps(attempt.adapter, spec.config)
+    if steps:  # on top of the pinned task image, which validation checked as it is
+        image = await attempt.backend.extend_image(image, steps)
     sandbox = await attempt.backend.create(image, task, spec.trial_id)
     attempt.resources.sandboxes.append(sandbox)
     await run_setup(sandbox, task)

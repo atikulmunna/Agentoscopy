@@ -66,3 +66,10 @@ class AgentAdapter(Protocol):
         ...
 
     async def teardown(self) -> None: ...
+
+
+def image_steps(adapter: AgentAdapter, config: AgentConfig) -> list[str]:
+    """Install steps the agent needs on top of the task image, such as a CLI agent's own
+    program. Adapters may define `image_steps(config) -> list[str]`; most need none."""
+    steps = getattr(adapter, "image_steps", None)
+    return list(steps(config)) if steps else []

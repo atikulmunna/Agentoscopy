@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shutil
@@ -33,6 +34,23 @@ class DockerBackend:
         with tempfile.TemporaryDirectory(prefix="agentoscopy-build-") as context:
             _write_build_context(Path(context), task)
             await _docker_checked("build", "--quiet", "--tag", tag, context)
+        return await _docker_checked("image", "inspect", "--format", "{{.Id}}", tag)
+
+    async def extend_image(self, image: str, steps: list[str]) -> str:
+        key = hashlib.sha256(json.dumps([image, steps]).encode()).hexdigest()[:16]
+        tag = f"agentoscopy-agent:{key}"
+        existing = await run_docker("image", "inspect", "--format", "{{.Id}}", tag)
+        if existing.exit_code == 0:
+            return existing.stdout.decode().strip()
+        base = f"agentoscopy-agent-base:{key}"  # BuildKit cannot build FROM a bare image ID
+        await _docker_checked("tag", image, base)
+        dockerfile = "\n".join([f"FROM {base}", *(_run_step(step) for step in steps)]) + "\n"
+        built = await run_docker("build", "--quiet", "--tag", tag, "-", stdin=dockerfile.encode())
+        await run_docker("image", "rm", base)  # only the extra tag goes; the image stays
+        if built.exit_code != 0:
+            raise SandboxError(
+                f"building the agent's install steps failed: {_text(built.stderr)[-2000:]}"
+            )
         return await _docker_checked("image", "inspect", "--format", "{{.Id}}", tag)
 
     async def create(self, image: str, task: Task, trial_id: str) -> DockerSandbox:
@@ -113,6 +131,17 @@ class DockerSandbox:
         timed_out = result.timed_out or (result.exit_code in TIMEOUT_EXIT_CODES and hit_deadline)
         return ExecResult(result.exit_code, result.stdout, result.stderr, timed_out)
 
+    async def start(self, *command: str) -> asyncio.subprocess.Process:
+        try:
+            return await asyncio.create_subprocess_exec(
+                "docker", "exec", "--interactive", "--user", AGENT_USER, "--workdir",
+                self._workdir, self.container_id, *command,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )  # fmt: skip
+        except FileNotFoundError as exc:
+            raise SandboxError("docker CLI not found on PATH") from exc
+
     async def read_file(self, path: str) -> bytes:
         result = await self._exec_raw("cat", "--", path, timeout_s=FILE_OP_TIMEOUT_S)
         if result.exit_code != 0 or result.timed_out:
@@ -180,10 +209,14 @@ def render_dockerfile(task: Task) -> str:
     lines = [f"FROM {environment.base_image}", f"WORKDIR {environment.workdir}"]
     if task.fixture_files():
         lines.append(f"COPY fixtures/ {environment.workdir}/")
-    # JSON exec form keeps multi-line and quoted build steps intact.
-    lines += [f"RUN {json.dumps(['/bin/sh', '-c', step])}" for step in environment.build]
+    lines += [_run_step(step) for step in environment.build]
     lines.append(f"RUN chown -R {AGENT_USER} {environment.workdir}")
     return "\n".join(lines) + "\n"
+
+
+def _run_step(step: str) -> str:
+    # JSON exec form keeps multi-line and quoted build steps intact.
+    return f"RUN {json.dumps(['/bin/sh', '-c', step])}"
 
 
 def container_run_args(

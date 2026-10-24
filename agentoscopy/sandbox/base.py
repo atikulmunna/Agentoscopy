@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -41,6 +42,11 @@ class Sandbox(Protocol):
 
     async def exec(self, cmd: str, timeout_s: int = 60) -> ExecResult: ...
 
+    async def start(self, *command: str) -> asyncio.subprocess.Process:
+        """Start a long-running process in the sandbox, talking over its stdin and stdout
+        (stderr is discarded). Stopping the sandbox stops it."""
+        ...
+
     async def read_file(self, path: str) -> bytes: ...
 
     async def write_file(self, path: str, data: bytes) -> None: ...
@@ -65,6 +71,11 @@ class ManagedSandbox(Sandbox, Protocol):
 class SandboxBackend(Protocol):
     async def prepare_image(self, task: Task) -> str:
         """Return the task image for this task version, building it once if needed (AD-6)."""
+        ...
+
+    async def extend_image(self, image: str, steps: list[str]) -> str:
+        """The image with an agent's install steps run on top of it, built once per image
+        and steps."""
         ...
 
     async def create(self, image: str, task: Task, trial_id: str) -> ManagedSandbox:

@@ -7,7 +7,9 @@ pass or fail depending on what the agent wrote.
 
 from __future__ import annotations
 
+import asyncio
 import shlex
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -58,6 +60,16 @@ class FakeSandbox:
             exists = any(name == path or name.startswith(path + "/") for name in self.files)
             return ExecResult(0 if exists else 1, b"", b"")
         return ExecResult(0, b"", b"")
+
+    async def start(self, *command: str) -> asyncio.subprocess.Process:
+        """Runs the command on this machine, with `python3` meaning this Python, so a
+        stdlib-only helper such as the model-call relay runs for real in tests."""
+        self.commands.append(shlex.join(command))
+        program = sys.executable if command[0] == "python3" else command[0]
+        return await asyncio.create_subprocess_exec(
+            program, *command[1:], stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )  # fmt: skip
 
     async def read_file(self, path: str) -> bytes:
         prefix = self._workdir + "/"
@@ -122,11 +134,17 @@ class FakeBackend:
         self._image = image
         self._image_error = image_error
         self._create_failures = create_failures
+        self.extensions: list[tuple[str, list[str]]] = []  # (image, install steps) requested
+        self.created_from: list[str] = []  # the image each agent sandbox started from
 
     async def prepare_image(self, task: Task) -> str:
         if self._image_error:
             raise SandboxError(self._image_error)
         return self._image
+
+    async def extend_image(self, image: str, steps: list[str]) -> str:
+        self.extensions.append((image, list(steps)))
+        return f"{image}+agent{len(self.extensions)}"
 
     async def create(self, image: str, task: Task, trial_id: str) -> FakeSandbox:
         if self._create_failures > 0:
@@ -134,6 +152,7 @@ class FakeBackend:
             raise SandboxError("injected sandbox failure")
         sandbox = FakeSandbox(self._agent_handler, self._files, on_destroy=self._release_agent)
         self.agent_sandboxes.append(sandbox)
+        self.created_from.append(image)
         self.trial_of[id(sandbox)] = trial_id
         self._live_agents += 1
         self.max_live_agents = max(self.max_live_agents, self._live_agents)
