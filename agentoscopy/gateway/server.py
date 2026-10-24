@@ -31,6 +31,7 @@ from agentoscopy.replay import (
     missing_tools,
     request_hash,
     with_injection,
+    without_thinking,
 )
 from agentoscopy.spec import Budget
 
@@ -313,7 +314,7 @@ async def _serve_playback(
         return web.Response(
             status=recorded.status, text=recorded.response, content_type="application/json"
         )
-    message = recorded.response
+    message = recorded.response if playback.fork_at is None else without_thinking(recorded.response)
     _record_response(session, call_index, message, FREE, time.monotonic(), 0.0, replayed=True)
     if not body.get("stream"):
         return web.json_response(message)

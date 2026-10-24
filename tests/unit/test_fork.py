@@ -10,7 +10,13 @@ from conftest import BASE_TASK, running_gateway
 
 from agentoscopy.cli.main import main
 from agentoscopy.recorder.trajectory import TrajectoryRecorder, read_events
-from agentoscopy.replay import Playback, RecordedCall, missing_tools, with_injection
+from agentoscopy.replay import (
+    Playback,
+    RecordedCall,
+    missing_tools,
+    request_hash,
+    with_injection,
+)
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.spec import Budget, load_task
 from agentoscopy.storage.store import Store
@@ -178,6 +184,51 @@ def test_a_recorded_tool_call_the_fork_cannot_make_stops_it(tmp_path):
 
     assert body["error"]["type"] == "replay_diverged_error"
     assert divergence == "step 1: the recorded answer calls bash, which this config lacks"
+
+
+THINKING_ANSWER = {
+    "id": "m", "type": "message", "role": "assistant", "model": "mock",
+    "stop_reason": "end_turn", "stop_sequence": None,
+    "usage": {"input_tokens": 1, "output_tokens": 1},
+    "content": [
+        {"type": "thinking", "thinking": "", "signature": "bound-to-the-source"},
+        {"type": "text", "text": "done"},
+    ],
+}  # fmt: skip
+PLAIN_REQUEST = {"model": "mock", "max_tokens": 32, "messages": [{"role": "user", "content": "go"}]}
+
+
+def first_answer_blocks(tmp_path, playback):
+    async def scenario():
+        async with running_gateway() as gateway:
+            recorder = TrajectoryRecorder(tmp_path / "t.jsonl", tmp_path / "a", "t", 1)
+            session = gateway.open_session("t", Budget(), recorder, "s", playback=playback)
+            client = anthropic.AsyncAnthropic(
+                base_url=session.endpoint.base_url, api_key=session.endpoint.token
+            )
+            try:
+                return [
+                    block.type for block in (await client.messages.create(**PLAIN_REQUEST)).content
+                ]
+            finally:
+                await client.close()
+                recorder.close()
+
+    return asyncio.run(scenario())
+
+
+def test_a_fork_drops_thinking_from_the_answers_it_replays(tmp_path):
+    # The provider rejects a thinking block outside the conversation that produced it, and
+    # the fork's later live calls would carry it.
+    recording = (RecordedCall("any-hash", 200, THINKING_ANSWER),)
+
+    assert first_answer_blocks(tmp_path, Playback(recording, fork_at=2)) == ["text"]
+
+
+def test_a_replay_keeps_the_answers_it_replays_whole(tmp_path):
+    recording = (RecordedCall(request_hash(PLAIN_REQUEST), 200, THINKING_ANSWER),)
+
+    assert first_answer_blocks(tmp_path, Playback(recording)) == ["thinking", "text"]
 
 
 def test_missing_tools_and_injection_helpers():

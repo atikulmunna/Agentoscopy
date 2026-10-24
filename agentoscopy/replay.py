@@ -21,6 +21,7 @@ from typing import Any
 from agentoscopy.recorder.trajectory import read_events
 
 REPLAY_DIVERGED_ERROR = "replay_diverged_error"
+THINKING_BLOCKS = ("thinking", "redacted_thinking")
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,16 @@ def missing_tools(message: dict[str, Any], request: dict[str, Any]) -> list[str]
         if block.get("type") == "tool_use"
     }
     return sorted(called - offered)
+
+
+def without_thinking(message: dict[str, Any]) -> dict[str, Any]:
+    """A recorded answer as a fork serves it. The provider binds thinking blocks to the
+    conversation that produced them and rejects them in any other, and a fork's live calls
+    carry the replayed answers in their history, so a fork answers with the other blocks."""
+    content = [
+        block for block in message.get("content") or [] if block.get("type") not in THINKING_BLOCKS
+    ]
+    return {**message, "content": content}
 
 
 def with_injection(body: dict[str, Any], text: str) -> dict[str, Any]:

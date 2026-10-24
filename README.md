@@ -274,7 +274,9 @@ own one-trial run; its trial page links to the original and to a side-by-side vi
 recording, whatever the agent asks, and makes step N and later live. Add `--agent CONFIG`
 to continue with another config, or `--inject TEXT` to add a message to the request at
 step N, and see what would have happened. A recorded answer that calls a tool the new
-config lacks stops the fork with `REPLAY_DIVERGED`. Its trial page links to the original
+config lacks stops the fork with `REPLAY_DIVERGED`. Replayed answers reach the agent
+without their thinking blocks: the provider binds those to the conversation that produced
+them and rejects them in the fork's later live calls. Its trial page links to the original
 and to the side-by-side view.
 
 `agentoscopy bisect <trial_id> --agent CONFIG` finds the step where a failed trial went
