@@ -9,6 +9,12 @@ vetoes reward hacking, and an LLM judge whose agreement with human reviewers is 
 Runs survive crashes and can be cancelled, and `agentoscopy ci` gates pull requests on
 regressions.
 
+![The compare page: a scripted agent against a copy of it with a broken fix](docs/compare.png)
+
+*The compare page for two real runs of the one-task example suite: the scripted test agent
+against a copy of it with a broken fix, six trials each. With one task the interval means
+little, as the warning says; a suite of ten or more tasks gives a real one.*
+
 ## How it compares
 
 [Inspect](https://inspect.aisi.org.uk/) is a broad framework for writing and running
