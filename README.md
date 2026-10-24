@@ -63,6 +63,7 @@ uv run agentoscopy compare <baseline_run> <candidate_run>
 uv run agentoscopy run --resume <run_id>                # continue a run after a crash
 uv run agentoscopy replay <trial_id>                    # rerun a trial from its recorded model calls
 uv run agentoscopy fork <trial_id> --at-step 3          # the same up to step 3, then live
+uv run agentoscopy bisect <trial_id> --agent CONFIG     # the step where a failed trial went wrong
 uv run agentoscopy agent check configs/claude.yaml      # try an agent config before a real run
 uv run agentoscopy cancel <run_id>
 uv run agentoscopy gc --older-than 30d                  # old run outputs, orphaned sandboxes
@@ -275,6 +276,22 @@ to continue with another config, or `--inject TEXT` to add a message to the requ
 step N, and see what would have happened. A recorded answer that calls a tool the new
 config lacks stops the fork with `REPLAY_DIVERGED`. Its trial page links to the original
 and to the side-by-side view.
+
+`agentoscopy bisect <trial_id> --agent CONFIG` finds the step where a failed trial went
+wrong. It forks the trial with a config that can pass the task, the rescue config: forking
+at step k keeps the trial's own first k - 1 model answers and lets the rescue config take
+over from step k. While those forks still pass, the trial's mistake has not happened yet;
+once they fail, it has. A binary search finds the last step from which the trial can be
+rescued, so the answer recorded at that step is the one that sealed the failure, and the
+command prints a side-by-side link to see what the rescue config did instead.
+
+Live calls vary, so each step runs `--trials` forks (3 by default) and counts as rescued
+when most of them pass. Both ends are checked first: if the rescue config fails the task
+from step 1, or still passes with every recorded answer kept, no step is blamed and the
+command exits `1`. `--budget-usd` (2 by default) caps live model spend across all forks;
+each fork run is labelled `bisect` and shows up in the run list. The search assumes that a
+trial that cannot be rescued from one step cannot be rescued from later steps either, so
+every probe is printed with its pass count.
 
 ## Tests
 
