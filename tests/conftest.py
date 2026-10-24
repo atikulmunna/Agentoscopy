@@ -1,3 +1,4 @@
+import subprocess
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -150,3 +151,57 @@ class SetupBackend(FakeBackend):
 
         sandbox.exec = exec
         return sandbox
+
+
+class GitRepo:
+    """A throwaway git repository for import tests, with a test-only commit identity."""
+
+    def __init__(self, path: Path) -> None:
+        path.mkdir(parents=True)
+        self.path = path
+        self.git("init", "-q")
+
+    def git(self, *args: str) -> str:
+        identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+        command = ["git", "-C", str(self.path), *identity, "-c", "commit.gpgsign=false", *args]
+        return subprocess.run(command, capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(self, message: str, files: dict[str, str] | None = None, delete=()) -> str:
+        for name, content in (files or {}).items():
+            target = self.path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8", newline="")
+        for name in delete:
+            self.git("rm", "-q", name)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+
+BUGGY_CALC = "def add(a, b):\n    return a - b\n"
+FIXED_CALC = "def add(a, b):\n    return a + b\n"
+OLD_CALC_TEST = (
+    "import unittest\n\nfrom calc import add\n\n\n"
+    "class AddTest(unittest.TestCase):\n"
+    "    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n"
+)
+NEW_CALC_TEST = (
+    OLD_CALC_TEST + "\n    def test_sum(self):\n        self.assertEqual(add(2, 3), 5)\n"
+)
+OTHER_TEST = (
+    "import unittest\n\n\nclass OtherTest(unittest.TestCase):\n"
+    "    def test_unrelated(self):\n        self.assertTrue(True)\n"
+)
+
+
+def calc_repo_with_fix(path: Path) -> tuple[GitRepo, str]:
+    """A repository whose second commit fixes add() and adds the test that catches it; a
+    second test file is left alone by the fix."""
+    repo = GitRepo(path)
+    repo.commit("Add calc", {"calc.py": BUGGY_CALC, "tests/test_calc.py": OLD_CALC_TEST,
+                             "tests/test_other.py": OTHER_TEST, "README.md": "calc\n"})  # fmt: skip
+    fix = repo.commit(
+        "add() subtracts instead of adding",
+        {"calc.py": FIXED_CALC, "tests/test_calc.py": NEW_CALC_TEST},
+    )
+    return repo, fix

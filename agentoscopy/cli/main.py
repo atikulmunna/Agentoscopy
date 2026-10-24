@@ -27,6 +27,7 @@ from agentoscopy.cli.common import (
     EXIT_INVALID_INPUT,
     EXIT_OK,
 )
+from agentoscopy.cli.importer import import_command
 from agentoscopy.cli.manage import cancel_command, gc_command
 from agentoscopy.cli.run import fork_command, replay_command, run_command, start_proxy
 from agentoscopy.cli.validate import validate_command
@@ -38,6 +39,7 @@ from agentoscopy.spec import SpecError, all_task_ids, load_task
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.stats.report import FORMATS, render, render_comparison
 from agentoscopy.storage.store import Store
+from agentoscopy.task_import import DEFAULT_BASE_IMAGE, RUNNERS
 
 TOKEN_ENV = "AGENTOSCOPY_API_TOKEN"  # a fixed API token, e.g. for a Prometheus scraper
 DURATION_PATTERN = re.compile(r"^(\d+)([smhd])$")
@@ -81,9 +83,10 @@ def _parser() -> argparse.ArgumentParser:
 def _add_task_commands(
     commands: argparse._SubParsersAction, common: argparse.ArgumentParser
 ) -> None:
-    """`task validate` and `task list`."""
-    task = commands.add_parser("task", help="validate and list tasks")
+    """`task validate`, `task list`, and `task import`."""
+    task = commands.add_parser("task", help="validate, list, and import tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
+    _add_task_import_command(task_commands, common)
     validate = task_commands.add_parser("validate", parents=[common], help="run WF-01 checks")
     validate.add_argument("task_ids", nargs="*", metavar="TASK_ID")
     validate.add_argument("--all", action="store_true", help="validate every task")
@@ -93,6 +96,43 @@ def _add_task_commands(
     validate.set_defaults(handler=validate_command)
     listing = task_commands.add_parser("list", parents=[common], help="tasks and validation status")
     listing.set_defaults(handler=_list_command)
+
+
+def _add_task_import_command(
+    task_commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`task import`: a task from a fix commit in a local git repository."""
+    importing = task_commands.add_parser(
+        "import", parents=[common], help="a task from a fix commit in a local git repository"
+    )
+    importing.add_argument("repo", type=Path, help="path to a local git repository")
+    importing.add_argument("commit", help="the commit that fixed the bug")
+    importing.add_argument("--id", required=True, help="the new task's id")
+    importing.add_argument(
+        "--instructions", help="what the agent is asked to do (default: the commit message)"
+    )
+    importing.add_argument(
+        "--runner",
+        choices=sorted(RUNNERS),
+        default="unittest",
+        help="test runner (default unittest)",
+    )
+    importing.add_argument(
+        "--base-image",
+        default=DEFAULT_BASE_IMAGE,
+        help="image pinned by digest (default python 3.12)",
+    )
+    importing.add_argument(
+        "--build",
+        action="append",
+        default=[],
+        metavar="COMMAND",
+        help="run while the image is built, e.g. to install requirements; repeat for several",
+    )
+    importing.add_argument(
+        "--tag", action="append", default=[], help="a tag for the task, e.g. for a tag suite"
+    )
+    importing.set_defaults(handler=import_command)
 
 
 def _add_agent_commands(
