@@ -242,3 +242,7 @@ uv run pytest tests/chaos        # kills a run mid-flight and resumes it
 uv run pytest -m "not integration"
 uv run ruff check . && uv run ruff format --check agentoscopy tests
 ```
+
+## License
+
+MIT License; see [LICENSE](LICENSE).

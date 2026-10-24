@@ -2,6 +2,8 @@
 name = "agentoscopy"
 version = "0.2.0"
 description = "Evaluation harness for LLM agents"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.10",
