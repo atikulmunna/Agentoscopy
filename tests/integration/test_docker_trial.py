@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import running_gateway
+from conftest import calc_repo_with_fix, running_gateway
 
 from agentoscopy.adapters.python import load_python_adapter
 from agentoscopy.cli.main import main
@@ -317,3 +317,12 @@ def test_a_fork_goes_live_from_its_step(tmp_path, capsys):
         assert leftovers("ps", fork["trial_id"]) == ""
     finally:
         store.close()
+
+
+def test_an_imported_fix_commit_validates(tmp_path):
+    """The hidden tests from the fix fail on the code before it and pass with it."""
+    repo, fix = calc_repo_with_fix(tmp_path / "repo")
+    common = ["--tasks-dir", str(tmp_path / "tasks"), "--home", str(tmp_path / "home")]
+
+    assert main(["task", "import", str(repo.path), fix, "--id", "fix-add", *common]) == 0
+    assert main(["task", "validate", "fix-add", *common]) == 0
