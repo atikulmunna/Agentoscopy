@@ -215,15 +215,20 @@ def create_fork(
     agent: Path | None = None,
     inject: str | None = None,
     has_credentials: bool,
+    trials: int = 1,
+    budget_usd: float | None = None,
+    extra_labels: dict[str, str] | None = None,
 ) -> PreparedRun:
-    """A one-trial run that replays a recorded trial up to step `at_step`, then continues live
-    (WF-11, FR-RPL-03): with another agent config, an injected message, or both."""
+    """A run that replays a recorded trial up to step `at_step`, then continues live (WF-11,
+    FR-RPL-03): with another agent config, an injected message, or both. Its `trials` forks
+    run at once; live calls vary, so several show how likely an outcome is."""
     labels = {"fork_of": trial_id, "fork_at": str(at_step)} | (
         {"injected": "yes"} if inject else {}
     )
     return _from_recorded_trial(
-        store, dirs, trial_id, mode="fork", labels=labels, has_credentials=has_credentials,
-        fork_at=at_step, inject=inject, agent=agent,
+        store, dirs, trial_id, mode="fork", labels=labels | (extra_labels or {}),
+        has_credentials=has_credentials, fork_at=at_step, inject=inject, agent=agent,
+        trials=trials, budget_usd=budget_usd,
     )  # fmt: skip
 
 
@@ -238,40 +243,44 @@ def _from_recorded_trial(
     fork_at: int | None = None,
     inject: str | None = None,
     agent: Path | None = None,
+    trials: int = 1,
+    budget_usd: float | None = None,  # replayed calls cost nothing; live ones keep trial caps
 ) -> PreparedRun:
     trial = store.get_trial(trial_id)
     if trial is None:
         raise LaunchError(f"NOT_FOUND: no trial {trial_id}")
     source = store.get_run(trial["run_id"])
-    recording = _recording(dirs.home, trial, fork_at)
+    recording = trial_recording(dirs.home, trial, fork_at)
     pinned, config = _task_and_config(store, dirs, source, trial["task_id"], agent, has_credentials)
     settings = RunSettings(
         suite_id=None,
         suite_version=None,
-        trials_per_task=1,
-        budget_usd=None,  # replayed calls cost nothing; a fork's live calls keep the trial budget
+        trials_per_task=trials,
+        budget_usd=budget_usd,
         seed=source["seed"],
-        concurrency=1,
+        concurrency=trials,
         harness_version=version("agentoscopy"),
         labels=labels,
         judge_model=source["judge_model"],
         review_rate=0.0,
         mode=mode,
     )
-    new_trial = NewTrial(
-        trial["task_id"],
-        trial["task_version"],
-        trial["trial_index"],  # the same seed key, so a mock judge answers the same
-        0,
-        pinned.task.spec.budget.max_cost_usd,
-        source_trial_id=trial_id,
-    )
-    run_id = store.create_run(config, settings, [new_trial])
+    cap = pinned.task.spec.budget.max_cost_usd
+    new_trials = [
+        # The first keeps the source's trial index, so a mock judge answers the same.
+        NewTrial(
+            trial["task_id"], trial["task_version"], trial["trial_index"] + i, i, cap, trial_id
+        )
+        for i in range(trials)
+    ]
+    run_id = store.create_run(config, settings, new_trials)
     playback = Playback(tuple(recording), fork_at, inject)
     return PreparedRun(run_id, [pinned], config, settings, playback)
 
 
-def _recording(home: Path, trial: dict[str, Any], fork_at: int | None) -> list[RecordedCall]:
+def trial_recording(
+    home: Path, trial: dict[str, Any], fork_at: int | None = None
+) -> list[RecordedCall]:
     """The model calls the trial's final attempt recorded, checked against the fork step."""
     trial_id = trial["trial_id"]
     trajectory, artifacts = attempt_paths(home, trial["run_id"], trial_id, trial["attempt"])
