@@ -9,11 +9,14 @@ vetoes reward hacking, and an LLM judge whose agreement with human reviewers is 
 Runs survive crashes and can be cancelled, and `agentoscopy ci` gates pull requests on
 regressions.
 
-![The compare page: a scripted agent against a copy of it with a broken fix](docs/compare.png)
+![The compare page: the example agent on Claude Haiku 5.5 against Claude Sonnet 5.5](docs/compare.png)
 
-*The compare page for two real runs of the one-task example suite: the scripted test agent
-against a copy of it with a broken fix, six trials each. With one task the interval means
-little, as the warning says; a suite of ten or more tasks gives a real one.*
+*The compare page for two real runs of the 20-task core suite, four trials per task: the
+example Claude agent on Claude Sonnet 5.5 (the baseline, $0.93 for 80 trials) against the
+same agent on Claude Haiku 5.5 ($0.12). Both models' fixes passed the hidden tests in all
+80 trials. The difference is the tamper check: Haiku also edited a task's protected test
+file in 59 trials, adding tests of its own, and each of those is vetoed; Sonnet did so in
+2. [Bisect](#replay-and-fork) found where one of those Haiku trials went wrong.*
 
 ## How it compares
 
@@ -232,6 +235,8 @@ Anthropic SDK's `base_url` and `api_key`.
 - `claude`: an example Claude agent (tool-use loop with `bash` and `write_file`). It needs
   `ANTHROPIC_API_KEY`. The key is handed to a separate credential-proxy process and removed
   from the `agentoscopy` process before any agent code is imported.
+- `claude-sonnet`, `claude-haiku`: the same agent at medium effort on Claude Sonnet 5.5 and
+  Claude Haiku 5.5, the two configs in the screenshot above.
 
 `agentoscopy agent check <config>` runs a config once on a built-in smoke task (reverse a
 file's contents). It passes when the agent called a model through the gateway, acted in
@@ -293,9 +298,26 @@ from step 1, or still passes with every recorded answer kept, no step is blamed 
 command exits `1`. `--budget-usd` (2 by default) caps live model spend across all forks.
 Each fork reserves the task's per-trial cap before it starts, as trials in a run do, so a
 budget below that cap is refused with `BUDGET_BELOW_TRIAL_CAP`. Each fork run is labelled
-`bisect` and shows up in the run list. The search assumes that a
-trial that cannot be rescued from one step cannot be rescued from later steps either, so
-every probe is printed with its pass count.
+`bisect` and shows up in the run list. The search assumes that a trial that cannot be
+rescued from one step cannot be rescued from later steps either, so every probe is printed
+with its pass count.
+
+For example, one of the failed Haiku trials in the screenshot above (`add-deep-merge`, nine
+model calls) was bisected with `configs/claude-sonnet.yaml` as the rescue config:
+
+```text
+  fork at step 1: 3 of 3 passed, rescued
+  fork at step 2: 3 of 3 passed, rescued
+  fork at step 3: 0 of 3 passed, not rescued
+  fork at step 5: 0 of 3 passed, not rescued
+  fork at step 10: 0 of 3 passed, not rescued
+step 2: the trial can still be rescued by taking over at step 2, but not once its own
+recorded answer at step 2 is kept. That answer sealed the failure.
+```
+
+Haiku's answer at step 2 read the protected test file. Once that was kept, Sonnet too
+appended its own tests to the file in every fork and was vetoed; taking over one step
+earlier, it passed every time. The 15 forks cost $0.24.
 
 ## Tests
 
