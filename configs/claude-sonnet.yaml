@@ -1,0 +1,8 @@
+# Model-backed agent on Claude Sonnet 5.5, the baseline in the README's comparison. Needs
+# ANTHROPIC_API_KEY when running; the key stays in the credential proxy process.
+name: claude-sonnet
+adapter: python
+entrypoint: agentoscopy.adapters.examples.claude_agent:ClaudeAgent
+params:
+  model: claude-sonnet-5-5
+  effort: medium

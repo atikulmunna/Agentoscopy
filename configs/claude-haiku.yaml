@@ -1,0 +1,8 @@
+# The same agent on Claude Haiku 5.5, the candidate in the README's comparison: about a
+# twentieth of Sonnet 5.5's price per token. Needs ANTHROPIC_API_KEY when running.
+name: claude-haiku
+adapter: python
+entrypoint: agentoscopy.adapters.examples.claude_agent:ClaudeAgent
+params:
+  model: claude-haiku-5-5
+  effort: medium
