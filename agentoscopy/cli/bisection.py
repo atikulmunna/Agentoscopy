@@ -48,7 +48,7 @@ def _bisect(args: argparse.Namespace, store: Store, proxy: CredentialProxy | Non
     dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
     run_ids: list[str] = []
     try:
-        recorded_calls = _failed_trial_calls(store, dirs, args.trial_id)
+        recorded_calls = _failed_trial_calls(store, dirs, args.trial_id, args.budget_usd)
         result = bisect_steps(recorded_calls, _prober(args, store, dirs, proxy, run_ids))
     except LaunchError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -59,7 +59,9 @@ def _bisect(args: argparse.Namespace, store: Store, proxy: CredentialProxy | Non
     return EXIT_OK if result.culprit_step is not None else EXIT_CHECK_FAILED
 
 
-def _failed_trial_calls(store: Store, dirs: Directories, trial_id: str) -> int:
+def _failed_trial_calls(store: Store, dirs: Directories, trial_id: str, budget_usd: float) -> int:
+    """The trial's recorded model calls, once it is known to be a failed trial that the
+    budget can fork at all."""
     trial = store.get_trial(trial_id)
     if trial is None:
         raise LaunchError(f"NOT_FOUND: no trial {trial_id}")
@@ -67,6 +69,12 @@ def _failed_trial_calls(store: Store, dirs: Directories, trial_id: str) -> int:
         raise LaunchError(
             f"NOT_FAILED: trial {trial_id} ended {trial['outcome']}; bisect looks for the step "
             "where a failed trial went wrong"
+        )
+    cap = store.task_spec(trial["task_id"], trial["task_version"])["budget"]["max_cost_usd"]
+    if budget_usd < cap:
+        raise LaunchError(
+            f"BUDGET_BELOW_TRIAL_CAP: --budget-usd ${budget_usd:.2f} is below the task's "
+            f"per-trial cap of ${cap:.2f}, which each fork reserves before it starts"
         )
     return len(trial_recording(dirs.home, trial))
 

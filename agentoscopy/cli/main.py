@@ -199,7 +199,8 @@ def _add_bisect_command(
         "--budget-usd",
         type=_positive_number,
         default=2.0,
-        help="ceiling on live model spend across every fork (default 2)",
+        help="ceiling on live model spend across every fork; at least the task's per-trial "
+        "cap, which each fork reserves before it starts (default 2)",
     )
     bisect.set_defaults(handler=bisect_command)
 

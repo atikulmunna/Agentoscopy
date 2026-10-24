@@ -204,12 +204,26 @@ def test_a_rescue_config_that_fails_too_blames_no_step(project, capsys):
 
 def test_bisect_stops_when_its_budget_runs_out(project, capsys):
     trial = failed_trial(project)
+    # Each fork reserves the task's $1 cap; the first probe's spend leaves less than that.
+    code = cli(project, "bisect", trial["trial_id"], "--agent", str(agent(project, "careful")),
+               "--trials", "1", "--budget-usd", "1.0001")  # fmt: skip
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "fork at step 1: 1 of 1 passed, rescued" in out
+    assert "no step found: the forks at step 5 were skipped: the bisection budget ran out" in out
+
+
+def test_a_budget_below_the_trial_cap_is_refused_before_any_fork(project, capsys):
+    trial = failed_trial(project)
+    runs_before = len(project[0].list_runs())
 
     code = cli(project, "bisect", trial["trial_id"], "--agent", str(agent(project, "careful")),
-               "--budget-usd", "0.000001")  # fmt: skip
+               "--budget-usd", "0.5")  # fmt: skip
 
-    assert code == 1
-    assert "the bisection budget ran out" in capsys.readouterr().out
+    assert code == 2
+    assert "BUDGET_BELOW_TRIAL_CAP" in capsys.readouterr().err
+    assert len(project[0].list_runs()) == runs_before
 
 
 def test_only_a_failed_trial_can_be_bisected(project, capsys):

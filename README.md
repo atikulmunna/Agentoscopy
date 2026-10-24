@@ -288,8 +288,10 @@ command prints a side-by-side link to see what the rescue config did instead.
 Live calls vary, so each step runs `--trials` forks (3 by default) and counts as rescued
 when most of them pass. Both ends are checked first: if the rescue config fails the task
 from step 1, or still passes with every recorded answer kept, no step is blamed and the
-command exits `1`. `--budget-usd` (2 by default) caps live model spend across all forks;
-each fork run is labelled `bisect` and shows up in the run list. The search assumes that a
+command exits `1`. `--budget-usd` (2 by default) caps live model spend across all forks.
+Each fork reserves the task's per-trial cap before it starts, as trials in a run do, so a
+budget below that cap is refused with `BUDGET_BELOW_TRIAL_CAP`. Each fork run is labelled
+`bisect` and shows up in the run list. The search assumes that a
 trial that cannot be rescued from one step cannot be rescued from later steps either, so
 every probe is printed with its pass count.
 
