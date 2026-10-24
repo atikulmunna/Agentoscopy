@@ -199,7 +199,14 @@ class AgentConfig(_Spec):
 
 class SuiteSpec(_Spec):
     name: str = Field(pattern=SLUG_PATTERN)
-    tasks: list[str] = Field(min_length=1)
+    tasks: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)  # also every task with one of these (FR-TASK-08)
+
+    @model_validator(mode="after")
+    def _selects_tasks(self) -> SuiteSpec:
+        if not self.tasks and not self.tags:
+            raise ValueError("a suite needs tasks, tags, or both")
+        return self
 
     @field_validator("tasks")
     @classmethod
@@ -262,6 +269,25 @@ def load_suite(suites_dir: Path, name: str) -> SuiteSpec:
     if suite.name != name:
         raise SpecError(f"{path}: name {suite.name!r} must match the file name {name!r}")
     return suite
+
+
+def suite_task_ids(tasks_dir: Path, suite: SuiteSpec) -> list[str]:
+    """The suite's listed tasks, then every other task that carries one of its tags."""
+    if not suite.tags:
+        return list(suite.tasks)
+    wanted = set(suite.tags)
+    tagged = [
+        task_id
+        for task_id in all_task_ids(tasks_dir)
+        if task_id not in suite.tasks and wanted & set(load_task(tasks_dir, task_id).spec.tags)
+    ]
+    return [*suite.tasks, *tagged]
+
+
+def all_task_ids(tasks_dir: Path) -> list[str]:
+    if not tasks_dir.is_dir():
+        return []
+    return sorted(path.name for path in tasks_dir.iterdir() if (path / TASK_FILE).is_file())
 
 
 def _check_slug(kind: str, value: str) -> None:

@@ -3,7 +3,14 @@ from pathlib import Path
 import pytest
 from conftest import BASE_TASK
 
-from agentoscopy.spec import SpecError, config_hash, load_agent_config, load_suite, load_task
+from agentoscopy.spec import (
+    SpecError,
+    config_hash,
+    load_agent_config,
+    load_suite,
+    load_task,
+    suite_task_ids,
+)
 
 
 def with_environment(**changes):
@@ -166,7 +173,7 @@ def test_loads_a_suite(tmp_path):
         ("name: other\ntasks: [task-a]\n", "must match the file name"),
         ("name: smoke\ntasks: [task-a, task-a]\n", "task ids must be unique"),
         ("name: smoke\ntasks: [Bad_Id]\n", "invalid task ids"),
-        ("name: smoke\ntasks: []\n", "tasks"),
+        ("name: smoke\ntasks: []\n", "a suite needs tasks, tags, or both"),
     ],
 )
 def test_invalid_suites_are_rejected(tmp_path, text, expected):
@@ -174,6 +181,28 @@ def test_invalid_suites_are_rejected(tmp_path, text, expected):
 
     with pytest.raises(SpecError, match=expected):
         load_suite(suites_dir, "smoke")
+
+
+@pytest.fixture
+def tagged_tasks(write_task, tasks_dir):
+    for task_id, tags in [("listed", ["mine"]), ("tagged", ["mine"]), ("other", ["theirs"]),
+                          ("also-tagged", ["x", "mine"])]:  # fmt: skip
+        write_task({**BASE_TASK, "id": task_id, "tags": tags})
+    return tasks_dir
+
+
+def test_a_suite_with_tags_adds_every_task_carrying_one(tmp_path, tagged_tasks):
+    suites_dir = write_suite(tmp_path, "mine", "name: mine\ntasks: [listed]\ntags: [mine]\n")
+
+    task_ids = suite_task_ids(tagged_tasks, load_suite(suites_dir, "mine"))
+
+    assert task_ids == ["listed", "also-tagged", "tagged"]  # listed first, then by id
+
+
+def test_a_suite_can_be_tags_alone(tmp_path, tagged_tasks):
+    suites_dir = write_suite(tmp_path, "theirs", "name: theirs\ntags: [theirs]\n")
+
+    assert suite_task_ids(tagged_tasks, load_suite(suites_dir, "theirs")) == ["other"]
 
 
 def test_spelling_out_a_default_value_keeps_the_same_version(write_task, tasks_dir):

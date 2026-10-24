@@ -19,7 +19,7 @@ from agentoscopy.github import GitHubError, pull_request_from_env, upsert_commen
 from agentoscopy.launch import Directories, LaunchError, create_run
 from agentoscopy.reporting import NotFound, comparison
 from agentoscopy.scheduler.plan import PlanError, pin_tasks
-from agentoscopy.spec import SpecError, load_suite
+from agentoscopy.spec import SpecError, load_suite, suite_task_ids
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.stats.report import render_ci_comment, render_comparison
 from agentoscopy.storage.store import Store
@@ -81,7 +81,8 @@ def _ci(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -
 
 def _find_baseline(store: Store, dirs: Directories, args: argparse.Namespace) -> str | None:
     """The newest recent completed run of the suite's current version on the baseline branch."""
-    pinned = pin_tasks(store, dirs.tasks, load_suite(dirs.suites, args.suite).tasks)
+    task_ids = suite_task_ids(dirs.tasks, load_suite(dirs.suites, args.suite))
+    pinned = pin_tasks(store, dirs.tasks, task_ids)
     refs = [(item.task.spec.id, item.version) for item in pinned]
     version = store.current_suite_version(args.suite, refs)
     if version is None:

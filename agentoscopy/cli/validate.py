@@ -13,7 +13,6 @@ from agentoscopy.cli.common import (
     EXIT_ENVIRONMENT,
     EXIT_INVALID_INPUT,
     EXIT_OK,
-    all_task_ids,
 )
 from agentoscopy.gateway.credential_proxy import CredentialProxy
 from agentoscopy.gateway.server import Gateway
@@ -21,7 +20,7 @@ from agentoscopy.graders.judge import GatewayJudge
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
 from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.scheduler.plan import PlanError, check_judge
-from agentoscopy.spec import SpecError, Task, load_task
+from agentoscopy.spec import SpecError, Task, all_task_ids, load_task
 from agentoscopy.storage.store import Store
 from agentoscopy.validation import CHECK_FAILURE_CODES, ValidationReport, validate_task
 

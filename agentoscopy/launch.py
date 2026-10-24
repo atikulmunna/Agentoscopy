@@ -30,6 +30,7 @@ from agentoscopy.spec import (
     load_agent_config,
     load_suite,
     load_task,
+    suite_task_ids,
 )
 from agentoscopy.storage.store import NewTrial, RunSettings, Store, TaskVersion
 from agentoscopy.worker.trial import attempt_paths
@@ -83,7 +84,11 @@ def create_run(
     A filtered suite run records no suite version: it did not run the whole suite, so it
     must never stand in for one (a CI baseline, say). The filter becomes a label."""
     try:
-        task_ids = load_suite(dirs.suites, request.suite).tasks if request.suite else request.tasks
+        task_ids = (
+            suite_task_ids(dirs.tasks, load_suite(dirs.suites, request.suite))
+            if request.suite
+            else request.tasks
+        )
         if request.task_filter:
             task_ids = select_tasks(store, dirs.tasks, list(task_ids), request.task_filter)
         pinned = pin_tasks(store, dirs.tasks, list(task_ids))

@@ -26,7 +26,6 @@ from agentoscopy.cli.common import (
     DB_NAME,
     EXIT_INVALID_INPUT,
     EXIT_OK,
-    all_task_ids,
 )
 from agentoscopy.cli.manage import cancel_command, gc_command
 from agentoscopy.cli.run import fork_command, replay_command, run_command, start_proxy
@@ -35,7 +34,7 @@ from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
 from agentoscopy.reporting import NotFound, comparison, run_summary
 from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.scheduler.runner import REVIEW_RATE
-from agentoscopy.spec import SpecError, load_task
+from agentoscopy.spec import SpecError, all_task_ids, load_task
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.stats.report import FORMATS, render, render_comparison
 from agentoscopy.storage.store import Store
