@@ -248,10 +248,12 @@ A task lives in `tasks/<id>/`:
 - `hidden/`: grader-only files, mounted read-only at `/hidden` during grading only
 - `reference/`: optional reference solution; its files overlay the workdir during validation
 
-Suites live in `suites/<name>.yaml` as a name and a list of task ids. `core` holds twenty
-small Python bug fixes and features of mixed difficulty, each with visible tests, hidden
-tests, a reference solution, and the tamper check; `example` holds the one task with an LLM
-judge. The run database, trajectories, and artifacts are written under `.agentoscopy/`.
+Suites live in `suites/<name>.yaml` as a name and a list of task ids. `core` is a starter
+suite for trying the harness and comparing agents, not a benchmark: twenty small Python
+tasks (thirteen bug fixes, six small features, and the example task) of mixed difficulty,
+each with visible tests, hidden tests, a reference solution, and the tamper check. `example`
+holds just the example task, the only one with an LLM judge. The run database,
+trajectories, and artifacts are written under `.agentoscopy/`.
 
 ## Replay and fork
 
