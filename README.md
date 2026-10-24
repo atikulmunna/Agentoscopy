@@ -1,12 +1,42 @@
 # Agentoscopy
 
-An evaluation harness for LLM agents. This is milestone M4: suites of tasks run as
-concurrent trials in Docker sandboxes, every model call goes through a budget-enforcing
-gateway, results land in SQLite, and runs can be compared statistically, from the CLI
-or in a local web UI. Trials are graded by commands, trajectory rules, a tamper check
-that vetoes reward hacking, and an LLM judge whose agreement with human reviewers is
-measured. Runs survive crashes and can be cancelled, and `agentoscopy ci` gates pull
-requests on regressions.
+An evaluation harness for LLM agents, built to answer one question for a team changing an
+agent: did this change make it better or worse, and how sure can we be? Suites of tasks run
+as concurrent trials in Docker sandboxes, every model call goes through a budget-enforcing
+gateway, results land in SQLite, and runs can be compared statistically, from the CLI or
+in a local web UI. Trials are graded by commands, trajectory rules, a tamper check that
+vetoes reward hacking, and an LLM judge whose agreement with human reviewers is measured.
+Runs survive crashes and can be cancelled, and `agentoscopy ci` gates pull requests on
+regressions.
+
+## How it compares
+
+[Inspect](https://inspect.aisi.org.uk/) is a broad framework for writing and running
+evaluations. It ships over 200 ready-made evaluations, runs untrusted code in Docker,
+Kubernetes, and other sandboxes, and can drive external agents such as Claude Code.
+[SWE-bench](https://github.com/SWE-bench/SWE-bench) is a benchmark: software issues
+collected from GitHub, with a harness that applies the patch a system submits and runs the
+repository's tests in Docker.
+
+Agentoscopy is narrower. It is for a team iterating on one agent that needs to know whether
+a change made it better or worse, and how far to trust the answer:
+
+- **Paired comparison.** Two runs are compared task by task. Each task is classified
+  (regressed, improved, flaky, and so on) with an exact test, and the verdict comes from a
+  95% confidence interval over tasks. A test checks that comparing a config with itself
+  gives a false verdict only about 5% of the time.
+- **CI gating.** `agentoscopy ci` runs the suite on a pull request, compares it with the
+  latest run on main, comments the verdict, and fails the check on a regression.
+- **Every model call through one gateway.** The gateway enforces each trial's step, token,
+  and cost budget and records every call, so a trial can be replayed from its recording,
+  or forked at a step to see what another config would have done.
+- **Grading that can be audited.** A tamper check vetoes reward hacking, and LLM judge
+  verdicts are sampled for human review, with each judge's agreement measured.
+
+It is also smaller. The bundled tasks are a starter suite for exercising the harness, not a
+benchmark, and agents are Python classes that run in the harness's process. To rank models,
+use a benchmark such as SWE-bench; for a wide range of ready-made evaluations, Inspect; to
+gate changes to one agent, Agentoscopy.
 
 ## Setup
 
