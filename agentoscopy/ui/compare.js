@@ -96,9 +96,8 @@ export async function compareView(baselineId, candidateId) {
 }
 
 function verdictReason(result) {
-  const regressedCritical = result.tasks.filter((task) => task.critical && task.class === "regressed");
-  if (result.verdict === "REGRESSION" && regressedCritical.length) {
-    return h("div", {}, `Critical task regressed: ${regressedCritical.map((task) => task.task_id).join(", ")}.`);
+  if (result.verdict === "REGRESSION" && result.critical_regressions.length) {
+    return h("div", {}, `Critical task regressed: ${result.critical_regressions.join(", ")}.`);
   }
   if (result.verdict === "NO_SIGNIFICANT_CHANGE") {
     return h("div", {}, "The 95% confidence interval of the change includes zero.");
