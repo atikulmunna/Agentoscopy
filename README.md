@@ -60,6 +60,7 @@ uv sync
 ```sh
 uv run agentoscopy task validate --all                  # build images, run null/reference/isolation checks
 uv run agentoscopy task list                            # validation status of every task
+uv run agentoscopy task import ../myrepo <commit> --id fix-x  # a task from a fix in your repo's history
 uv run agentoscopy run --suite example --agent configs/scripted-fix.yaml --trials 3
 uv run agentoscopy report <run_id> --format md          # table, md, or json
 uv run agentoscopy compare <baseline_run> <candidate_run>
@@ -258,12 +259,37 @@ A task lives in `tasks/<id>/`:
 - `hidden/`: grader-only files, mounted read-only at `/hidden` during grading only
 - `reference/`: optional reference solution; its files overlay the workdir during validation
 
-Suites live in `suites/<name>.yaml` as a name and a list of task ids. `core` is a starter
-suite for trying the harness and comparing agents, not a benchmark: twenty small Python
-tasks (thirteen bug fixes, six small features, and the example task) of mixed difficulty,
-each with visible tests, hidden tests, a reference solution, and the tamper check. `example`
-holds just the example task, the only one with an LLM judge. The run database,
-trajectories, and artifacts are written under `.agentoscopy/`.
+Suites live in `suites/<name>.yaml` as a name and a list of task ids, a list of `tags`, or
+both: a suite with tags also takes every task that carries one of them, after the listed
+ones. `core` is a starter suite for trying the harness and comparing agents, not a
+benchmark: twenty small Python tasks (thirteen bug fixes, six small features, and the
+example task) of mixed difficulty, each with visible tests, hidden tests, a reference
+solution, and the tamper check. `example` holds just the example task, the only one with an
+LLM judge. The run database, trajectories, and artifacts are written under `.agentoscopy/`.
+
+### Tasks from your own repository
+
+`agentoscopy task import <repo> <commit> --id ID` turns a commit that fixed a bug in a local
+git repository into a task, so agents are measured on your code's real bugs:
+
+- the commit before the fix is the starting code;
+- the test files the fix added or changed are the hidden tests, at their fixed versions.
+  Their old versions are held back from the starting code, since they assert the bug;
+- the other files the fix changed are the reference solution;
+- the commit message is the instructions, unless `--instructions` says otherwise.
+
+Then `agentoscopy task validate ID` checks that the hidden tests fail before the fix and pass
+with it, as for any task. Tests run with `unittest` by default; `--runner pytest` installs
+pytest in the image. `--build COMMAND` runs while the image is built, after the code is
+copied in, for dependencies (`--build "pip install -r requirements.txt"`), and
+`--base-image` replaces the default Python 3.12 image (pin it by digest). Tag imports with
+`--tag myrepo` and a suite with `tags: [myrepo]` collects them all.
+
+The repository is only read through git; nothing is fetched. A commit that changes no
+tests, changes only tests, or deletes code is refused, and so is one whose test files would
+share a name, because hidden tests are flattened into one folder. As a check, a fix from
+this project's own history (`8b1b0e7`, with `--runner pytest --build "pip install ."`)
+imports into a task that validates.
 
 ## Replay and fork
 
