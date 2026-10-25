@@ -70,10 +70,10 @@ class TrialSession:
         if token_room <= 0:
             raise BudgetExhausted("tokens", used_tokens, budget.max_tokens)
         input_cost = estimated_input_tokens * price.input / 1_000_000
-        cost_room = int(
-            (budget.max_cost_usd - usage.cost_usd - input_cost) * 1_000_000 / price.output
-        )
-        if cost_room <= 0:
+        remaining_usd = budget.max_cost_usd - usage.cost_usd - input_cost
+        # Free output, as from a local model, leaves only the token budget to cap it.
+        cost_room = int(remaining_usd * 1_000_000 / price.output) if price.output else token_room
+        if remaining_usd <= 0 or cost_room <= 0:
             raise BudgetExhausted("cost", round(usage.cost_usd, 6), budget.max_cost_usd)
         return min(requested_max_tokens, token_room, cost_room)
 

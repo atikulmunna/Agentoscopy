@@ -105,6 +105,16 @@ def test_admit_caps_output_by_remaining_cost(recorder):
     assert trial.admit(price, requested_max_tokens=10_000, estimated_input_tokens=100) == 180
 
 
+def test_admit_caps_free_output_by_tokens_alone(recorder):
+    trial = session(recorder, max_tokens=1_000)
+    free = Price(input=0.0, output=0.0, cache_read=0.0)  # a local model
+
+    assert trial.admit(free, requested_max_tokens=10_000, estimated_input_tokens=100) == 900
+    trial.usage = replace(trial.usage, cost_usd=trial.budget.max_cost_usd)
+    with pytest.raises(BudgetExhausted, match="cost"):  # spent elsewhere in the trial
+        trial.admit(free, requested_max_tokens=10, estimated_input_tokens=1)
+
+
 @pytest.mark.parametrize(
     ("budget", "usage_change", "dimension"),
     [
