@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,7 @@ class RelayBridge:
         await self._stop()
 
     async def _serve(self) -> None:
-        async for line in self._process.stdout:
+        async for line in _lines(self._process.stdout):
             frame = json.loads(line)
             if frame.get("type") == "request":
                 task = asyncio.create_task(self._forward(frame))
@@ -119,6 +120,19 @@ class RelayBridge:
         except TimeoutError:
             self._process.kill()
             await self._process.wait()
+
+
+async def _lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+    """Lines of any length. StreamReader's own readline stops at 64 KiB, and one model
+    request from a real agent is a single line far longer than that."""
+    buffer = bytearray()
+    while chunk := await stream.read(1 << 16):
+        searched = len(buffer)  # only new bytes can hold the end of the current line
+        buffer += chunk
+        while (end := buffer.find(b"\n", searched)) >= 0:
+            yield bytes(buffer[:end])
+            del buffer[: end + 1]
+            searched = 0
 
 
 def _b64(data: bytes) -> str:

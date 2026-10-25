@@ -74,6 +74,21 @@ def test_the_gateways_refusals_pass_through_unchanged(tmp_path):
     assert "has no price" in json.loads(body)["error"]["message"]
 
 
+def test_a_request_larger_than_a_stream_line_limit_gets_through(tmp_path):
+    # Real agents send long conversations; one request is far more than asyncio's 64 KiB
+    # default line limit once it is a single JSON line.
+    long_prompt = "x" * 200_000
+    body = {**REQUEST, "messages": [{"role": "user", "content": long_prompt}]}
+
+    async def scenario(url, http):
+        return await asyncio.wait_for(post(http, url, body), 30)
+
+    (status, _, _), events = through_relay(tmp_path, scenario)
+
+    assert status == 200
+    assert any(e["type"] == "model_request" for e in events)
+
+
 def test_concurrent_calls_are_each_answered(tmp_path):
     async def scenario(url, http):
         return await asyncio.gather(*(post(http, url, REQUEST) for _ in range(3)))
