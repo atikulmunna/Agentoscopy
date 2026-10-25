@@ -30,6 +30,7 @@ from agentoscopy.cli.common import (
 from agentoscopy.cli.importer import import_command
 from agentoscopy.cli.manage import cancel_command, gc_command
 from agentoscopy.cli.run import connect_models, fork_command, replay_command, run_command
+from agentoscopy.cli.swebench import swebench_command
 from agentoscopy.cli.validate import validate_command
 from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
 from agentoscopy.reporting import NotFound, comparison, run_summary, tradeoff
@@ -88,10 +89,11 @@ def _parser() -> argparse.ArgumentParser:
 def _add_task_commands(
     commands: argparse._SubParsersAction, common: argparse.ArgumentParser
 ) -> None:
-    """`task validate`, `task list`, and `task import`."""
+    """`task validate`, `task list`, `task import`, and `task swebench`."""
     task = commands.add_parser("task", help="validate, list, and import tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
     _add_task_import_command(task_commands, common)
+    _add_task_swebench_command(task_commands, common)
     validate = task_commands.add_parser("validate", parents=[common], help="run WF-01 checks")
     validate.add_argument("task_ids", nargs="*", metavar="TASK_ID")
     validate.add_argument("--all", action="store_true", help="validate every task")
@@ -138,6 +140,22 @@ def _add_task_import_command(
         "--tag", action="append", default=[], help="a tag for the task, e.g. for a tag suite"
     )
     importing.set_defaults(handler=import_command)
+
+
+def _add_task_swebench_command(
+    task_commands: argparse._SubParsersAction, common: argparse.ArgumentParser
+) -> None:
+    """`task swebench`: tasks from SWE-bench rows."""
+    swebench = task_commands.add_parser(
+        "swebench", parents=[common], help="tasks from SWE-bench rows in a .json or .jsonl file"
+    )
+    swebench.add_argument("rows", type=Path, help="SWE-bench rows, as .json or .jsonl")
+    swebench.add_argument("instance_ids", nargs="*", metavar="INSTANCE_ID")
+    swebench.add_argument("--all", action="store_true", help="import every row")
+    swebench.add_argument(
+        "--tag", action="append", default=[], help="another tag for the tasks, besides swe-bench"
+    )
+    swebench.set_defaults(handler=swebench_command)
 
 
 def _add_agent_commands(
