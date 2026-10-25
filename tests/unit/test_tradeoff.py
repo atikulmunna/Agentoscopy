@@ -1,8 +1,11 @@
-"""Cost against quality across runs (agentoscopy.stats.tradeoff)."""
+"""Cost against quality across runs (agentoscopy.stats.tradeoff) and how it is printed."""
+
+import json
 
 import pytest
 
 from agentoscopy.stats.compare import CompareError, RunInputs
+from agentoscopy.stats.report import render_tradeoff
 from agentoscopy.stats.tradeoff import tradeoff_runs
 
 
@@ -93,3 +96,27 @@ def test_unscored_trials_do_not_count_toward_cost():
 def test_one_run_has_nothing_to_weigh_against():
     with pytest.raises(CompareError, match="RUN_COUNT"):
         tradeoff_runs([run("alone", passing(1.0), 0.001)])
+
+
+SMALL = [run("pricey", passing(1.0), 0.0125), run("thrifty", passing(0.5), 0.001)]
+
+
+def test_the_table_lists_runs_cheapest_first_and_marks_the_frontier():
+    text = render_tradeoff(tradeoff_runs(SMALL), "table")
+
+    lines = text.splitlines()
+    assert lines[0].startswith("pass rate against agent cost over 4 shared tasks")
+    rows = [line.split() for line in lines if line.startswith(("pricey", "thrifty"))]
+    assert [row[0] for row in rows] == ["thrifty", "pricey"]
+    assert rows[1][2:] == ["100.0%", "100.0%", "to", "100.0%", "$0.0125", "8/8", "yes"]
+    assert "warning: only 4 shared tasks" in text
+
+
+def test_markdown_and_json_carry_the_same_points():
+    result = tradeoff_runs(SMALL)
+
+    markdown = render_tradeoff(result, "md")
+
+    assert markdown.startswith("# Cost against quality")
+    assert "| thrifty | thrifty | 50.0% |" in markdown
+    assert json.loads(render_tradeoff(result, "json")) == result

@@ -127,6 +127,38 @@ def render_comparison(comparison: dict[str, Any], output_format: str) -> str:
     return "\n".join([*lines, "", *_text_table(header, rows)])
 
 
+def render_tradeoff(tradeoff: dict[str, Any], output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(tradeoff, indent=2)
+    shared = tradeoff["shared_tasks"]
+    lines = [
+        f"pass rate against agent cost over {shared} shared task{'' if shared == 1 else 's'}, "
+        "cheapest first",
+        "frontier: no other run passes at least as often for no more cost",
+        *(f"warning: {warning}" for warning in tradeoff["warnings"]),
+    ]
+    header = ("run", "config", "pass rate", "95% CI", "cost/trial", "passes", "frontier")
+    rows = [_tradeoff_row(point) for point in tradeoff["runs"]]
+    if output_format == "md":
+        title = "# Cost against quality"
+        table = _markdown_table(header, rows)
+        return "\n".join([title, "", *(f"- {line}" for line in lines), "", *table])
+    return "\n".join([*lines, "", *_text_table(header, rows)])
+
+
+def _tradeoff_row(point: dict[str, Any]) -> tuple[str, ...]:
+    low, high = point["pass_rate_ci_95"]
+    return (
+        point["run_id"],
+        point["config_name"] or "-",
+        _pct(point["pass_rate"]),
+        f"{_pct(low)} to {_pct(high)}",
+        f"${point['cost_per_trial_usd']:.4f}",
+        f"{point['passes']}/{point['trials']}",
+        "yes" if point["on_frontier"] else "no",
+    )
+
+
 def render_ci_comment(comparison: dict[str, Any], *, overridden: bool, truncated: bool) -> str:
     """The pull request comment for `agentoscopy ci` (WF-10 step 4), in Markdown."""
     verdict = comparison["verdict"].replace("_", " ").capitalize()
