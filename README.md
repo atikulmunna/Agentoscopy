@@ -44,7 +44,8 @@ a change made it better or worse, and how far to trust the answer:
 
 It is also smaller. The bundled tasks are a starter suite for exercising the harness, not a
 benchmark, though `task import` turns fixes from your own repository's history into tasks;
-and agents are Python classes that run in the harness's process. To rank models,
+and agents are Python classes, or command-line agents such as Claude Code run inside the
+sandbox. To rank models,
 use a benchmark such as SWE-bench; for a wide range of ready-made evaluations, Inspect; to
 gate changes to one agent, Agentoscopy.
 
@@ -239,6 +240,30 @@ Anthropic SDK's `base_url` and `api_key`.
   from the `agentoscopy` process before any agent code is imported.
 - `claude-sonnet`, `claude-haiku`: the same agent at medium effort on Claude Sonnet 5.5 and
   Claude Haiku 5.5, the two configs in the screenshot above.
+- `claude-code-haiku`: Claude Code itself, run inside the sandbox on Claude Haiku 5.5 (see
+  below).
+
+### Command-line agents
+
+`agentoscopy.adapters.command:CommandAgent` runs any command-line agent inside the sandbox.
+Its config gives `install` steps, which are built on top of the task image once per task
+image; the `command`, where `{instructions}` becomes the task's instructions; and extra
+`env`. The command runs in the workdir with `ANTHROPIC_BASE_URL` set to a relay on the
+sandbox's own loopback address. The relay hands each request to the harness over the same
+`docker exec` channel the harness already uses, and the harness sends it to the trial's
+gateway with the trial's token. So the sandbox keeps no network at all, the agent never
+holds a credential, and the gateway enforces the trial's budget as for any other agent.
+The task image needs `python3`, which runs the relay.
+
+Exit code 0 ends the trial as `agent_done`, another code as an agent error, and running past
+the task's timeout as `timeout`. Every model call is recorded; the agent's own tool calls
+happen inside its process, so the trajectory shows them only as the one command and its
+output, and trajectory graders have less to go on.
+
+`configs/claude-code-haiku.yaml` installs Node 22 and Claude Code 2.1.310 and points every
+model Claude Code picks at `claude-haiku-5-5`. It passes `agentoscopy agent check`, and on
+three core tasks the example Haiku agent always failed by editing protected tests, it passed
+two of them in both trials (4 of 6 trials, $0.013 in all).
 
 `agentoscopy agent check <config>` runs a config once on a built-in smoke task (reverse a
 file's contents). It passes when the agent called a model through the gateway, acted in
