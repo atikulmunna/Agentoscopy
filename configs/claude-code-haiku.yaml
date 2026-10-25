@@ -1,0 +1,32 @@
+# Claude Code, Anthropic's command-line coding agent, running inside the sandbox on Claude
+# Haiku 5.5. The install steps add Node 22 and a pinned Claude Code on top of the task image
+# (built once per task image). Its model calls reach the gateway through the relay, so the
+# sandbox stays offline and Claude Code never holds a credential. Needs ANTHROPIC_API_KEY
+# when running, as any real model does.
+name: claude-code-haiku
+adapter: python
+entrypoint: agentoscopy.adapters.command:CommandAgent
+params:
+  install:
+    - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils && rm -rf /var/lib/apt/lists/*
+    - ARCH=$(uname -m | sed -e s/x86_64/x64/ -e s/aarch64/arm64/) && curl -fsSL "https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-$ARCH.tar.xz" | tar -xJ -C /usr/local --strip-components=1
+    - npm install -g @anthropic-ai/claude-code@2.1.310
+  command:
+    - claude
+    - -p
+    - "{instructions}"
+    - --model
+    - claude-haiku-5-5
+    - --dangerously-skip-permissions
+    - --max-turns
+    - "30"
+  env:
+    # Every model Claude Code picks must be one the gateway can price.
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-haiku-5-5
+    ANTHROPIC_DEFAULT_SONNET_MODEL: claude-haiku-5-5
+    ANTHROPIC_DEFAULT_OPUS_MODEL: claude-haiku-5-5
+    # The sandbox is offline; nothing should try to phone home or update itself.
+    DISABLE_TELEMETRY: "1"
+    DISABLE_AUTOUPDATER: "1"
+    DISABLE_ERROR_REPORTING: "1"
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
