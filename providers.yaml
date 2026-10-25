@@ -31,5 +31,5 @@ providers:
     api_key_env: OPENROUTER_API_KEY
     prices:
       # Add each model you use with OpenRouter's current price for it, for example:
-      # qwen/qwen3-coder: {input: 0.22, output: 0.95}
+      # qwen/qwen3-coder: {input: 0.30, output: 1.00}
       {}

@@ -43,11 +43,12 @@ a change made it better or worse, and how far to trust the answer:
   verdicts are sampled for human review, with each judge's agreement measured.
 
 It is also smaller. The bundled tasks are a starter suite for exercising the harness, not a
-benchmark, though `task import` turns fixes from your own repository's history into tasks;
-and agents are Python classes, or command-line agents such as Claude Code run inside the
-sandbox. To rank models,
-use a benchmark such as SWE-bench; for a wide range of ready-made evaluations, Inspect; to
-gate changes to one agent, Agentoscopy.
+benchmark, though `task import` turns fixes from your own repository's history into tasks.
+Agents are Python classes, or command-line agents such as Claude Code run inside the
+sandbox, and models come from Anthropic or any server that speaks its API: open models on
+OpenRouter, or local ones on Ollama, llama.cpp, LM Studio, or vLLM. To rank models, use a
+benchmark such as SWE-bench; for a wide range of ready-made evaluations, Inspect; to gate
+changes to one agent, Agentoscopy.
 
 ## Setup
 
@@ -265,6 +266,61 @@ Anthropic SDK's `base_url` and `api_key`.
   Claude Haiku 5.5, the two configs in the screenshot above.
 - `claude-code-haiku`: Claude Code itself, run inside the sandbox on Claude Haiku 5.5 (see
   below).
+- `ollama-qwen3`: the example agent on Qwen3 8B served by a local Ollama (see
+  [Open models and local servers](#open-models-and-local-servers)).
+
+### Open models and local servers
+
+Models from other servers are named `<provider>/<model>`, for example `ollama/qwen3:8b` or
+`openrouter/qwen/qwen3-coder`, wherever a config or `--judge-model` names a model; Claude
+models keep their plain names. `providers.yaml` lists the providers, and `--providers FILE`
+names another file. Each server must speak the Anthropic Messages API, as Ollama, llama.cpp's
+`llama-server`, LM Studio 0.4.1 or later, vLLM, and OpenRouter do. The shipped file lists all
+five, the local ones on their default ports. With a model added for OpenRouter, two of the
+entries look like this:
+
+```yaml
+providers:
+  ollama:
+    base_url: http://localhost:11434
+    prices:
+      "*": {input: 0, output: 0}        # every model it serves, counted as free
+  openrouter:
+    base_url: https://openrouter.ai/api
+    api_key_env: OPENROUTER_API_KEY
+    prices:                             # USD per million tokens; check OpenRouter's page
+      qwen/qwen3-coder: {input: 0.30, output: 1.00}
+```
+
+The gateway strips the provider's name from the model before it forwards a call, and
+enforces budgets and records calls as it does for Claude. Every call is budgeted, so a
+model without a price is refused; `"*"` prices every model a provider does not list. A
+server that needs a key gets it from the credential proxy, which takes it out of the
+`agentoscopy` process like `ANTHROPIC_API_KEY`, and a key is never sent over plain HTTP to a
+remote host. A server that needs no key, such as a local one, is called directly. Local
+models are counted as free, so their trials are limited by steps and tokens, not cost.
+
+To evaluate a local model with Ollama, pull one that can call tools and serve it with
+enough context for a coding session:
+
+```sh
+ollama pull qwen3:8b
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+uv run agentoscopy agent check configs/ollama-qwen3.yaml
+uv run agentoscopy run --suite core --agent configs/ollama-qwen3.yaml --trials 4
+```
+
+Command-line agents name provider models the same way, for example Claude Code with
+`--model ollama/qwen3:8b`. A judge can run on a local model too, with
+`--judge-model ollama/<model>`, though a small model makes a poor judge; the
+[calibration report](#human-review-and-judge-calibration) shows how far to trust it.
+
+Checked for real with the example agent on `qwen/qwen3-coder-30b-a3b-instruct` through
+OpenRouter: `agent check` passed with 5 model calls for $0.0002, and on three core tasks it
+passed 4 of 6 trials for $0.003 in all. Both failures were tamper vetoes for editing a
+protected test file, and its key never reached the recorded trajectories. A run reserves
+each trial's `max_cost_usd` (a task's cap, $1 by default) before starting it, so with a
+model this cheap, a run budget near $1 leaves room for only one trial at a time.
 
 ### Command-line agents
 

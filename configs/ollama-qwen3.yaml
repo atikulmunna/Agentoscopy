@@ -1,0 +1,11 @@
+# The example agent on a local model served by Ollama. Start Ollama and pull a model that can
+# call tools first (ollama pull qwen3:8b), and give it room for a coding session with
+# OLLAMA_CONTEXT_LENGTH=32768. The model is named <provider>/<model> and routed by
+# providers.yaml. Local models count as free, so a trial's step and token budgets limit it.
+name: ollama-qwen3
+adapter: python
+entrypoint: agentoscopy.adapters.examples.claude_agent:ClaudeAgent
+params:
+  model: ollama/qwen3:8b
+  effort: null  # a Claude setting that other servers do not take
+  max_tokens: 8192
