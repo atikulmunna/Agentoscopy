@@ -12,6 +12,8 @@ const PLOT_W = WIDTH - PAD.left - PAD.right;
 const PLOT_H = HEIGHT - PAD.top - PAD.bottom;
 const LABEL_ALL_UP_TO = 8; // past this, only frontier runs are named on the chart; the table names all
 const LABEL_BOX = { width: 120, height: 20 }; // roughly one run name, in chart units
+const LABEL_BELOW = 24; // label baselines, relative to the point
+const LABEL_ABOVE = -12;
 
 export async function tradeoffView(runIds) {
   const result = await api(`/tradeoff?runs=${runIds.map(enc).join(",")}`);
@@ -59,27 +61,32 @@ function chart(runs) {
   const scale = costScale(runs);
   const frontier = runs.filter((run) => run.on_frontier);
   const beaten = runs.filter((run) => !run.on_frontier);
-  const named = namedRuns(runs.length <= LABEL_ALL_UP_TO ? [...frontier, ...beaten] : frontier, scale);
+  const labels = labelPlaces(runs.length <= LABEL_ALL_UP_TO ? [...frontier, ...beaten] : frontier, scale);
   return svg(
     "svg",
     { viewBox: `0 0 ${WIDTH} ${HEIGHT}`, role: "group", "aria-label": "Pass rate against agent cost per trial, one point per run" },
     ...axes(scale),
     frontierStep(frontier, scale),
-    ...[...beaten, ...frontier].map((run) => point(run, scale, named.has(run.run_id))),
+    ...[...beaten, ...frontier].map((run) => point(run, scale, labels.get(run.run_id)?.y)),
   );
 }
 
-// Frontier runs claim label space first; a label that would land on one already placed is left
-// to the tooltip and the table (two runs of one config often sit almost on top of each other).
-function namedRuns(candidates, scale) {
-  const placed = [];
+// Each named run's label spot: the run's x and the y of the label's baseline. The step line
+// leaves each frontier run to the right and reaches it from below, so a label below and to the
+// right stays clear of it, and so does one above, where it goes when the spot below is taken or
+// near the floor. Frontier runs claim label space first; a run with neither spot free is left
+// to the tooltip and the table.
+function labelPlaces(candidates, scale) {
+  const placed = new Map();
+  const taken = (x, y) => [...placed.values()].some((spot) => Math.abs(spot.x - x) < LABEL_BOX.width && Math.abs(spot.y - y) < LABEL_BOX.height);
   for (const run of candidates) {
     const x = scale.x(run.cost_per_trial_usd);
     const y = scale.y(run.pass_rate);
-    const clashes = placed.some((spot) => Math.abs(spot.x - x) < LABEL_BOX.width && Math.abs(spot.y - y) < LABEL_BOX.height);
-    if (!clashes) placed.push({ x, y, runId: run.run_id });
+    const offsets = run.pass_rate > 0.1 ? [LABEL_BELOW, LABEL_ABOVE] : [LABEL_ABOVE];
+    const offset = offsets.find((dy) => !taken(x, y + dy));
+    if (offset !== undefined) placed.set(run.run_id, { x, y: y + offset });
   }
-  return new Set(placed.map((spot) => spot.runId));
+  return placed;
 }
 
 function costScale(runs) {
@@ -118,15 +125,12 @@ function frontierStep(frontier, scale) {
   return svg("path", { class: "step", d });
 }
 
-function point(run, scale, labelled) {
+function point(run, scale, labelY) {
   const [low, high] = run.pass_rate_ci_95;
   const cx = scale.x(run.cost_per_trial_usd);
   const cy = scale.y(run.pass_rate);
   const name = run.config_name || shortId(run.run_id);
-  // The step line leaves each frontier run to the right and reaches it from below, so a label
-  // below and to the right stays clear of it (above, near the floor; to the left, near the edge).
-  const nearRight = cx > PAD.left + PLOT_W * 0.75;
-  const labelY = run.pass_rate > 0.1 ? cy + 24 : cy - 12;
+  const nearRight = cx > PAD.left + PLOT_W * 0.75; // its label goes to the left, inside the chart
   const summary = `${pct(run.pass_rate)} pass rate (95% CI ${pct(low)} to ${pct(high)}), ${usd(run.cost_per_trial_usd)} per trial`;
   const node = svg(
     "a",
@@ -135,7 +139,7 @@ function point(run, scale, labelled) {
     svg("line", { class: "whisker", x1: cx, x2: cx, y1: scale.y(high), y2: scale.y(low) }),
     svg("circle", { class: "halo", cx, cy, r: 8 }),
     svg("circle", { class: "dot", cx, cy, r: 5 }),
-    ...(labelled ? [svg("text", { class: "name", x: nearRight ? cx - 12 : cx + 12, y: labelY, "text-anchor": nearRight ? "end" : "start" }, name)] : []),
+    ...(labelY === undefined ? [] : [svg("text", { class: "name", x: nearRight ? cx - 12 : cx + 12, y: labelY, "text-anchor": nearRight ? "end" : "start" }, name)]),
   );
   const detail = `${summary}; ${run.passes} of ${run.trials} trials passed; run ${shortId(run.run_id)}`;
   return attachTip(node, name, detail);
