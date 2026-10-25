@@ -10,6 +10,7 @@ import { hooks, render } from "./page.js";
 import { remember, stored } from "./prefs.js";
 import { calibrationView, reviewView } from "./review.js";
 import { runsView, runView } from "./runs.js";
+import { tradeoffView } from "./tradeoff.js";
 import { trialView } from "./trial.js";
 
 const THEME_KEY = "agentoscopy.theme";
@@ -20,6 +21,7 @@ const ROUTES = [
   [/^#\/trials\/([^/]+)$/, (id) => trialView(id)],
   [/^#\/compare\/([^/]+)\/([^/]+)$/, (a, b) => compareView(a, b)],
   [/^#\/side\/([^/]+)\/([^/]+)$/, (a, b) => sideView(a, b)],
+  [/^#\/tradeoff\/([^/]+)$/, (ids) => tradeoffView(ids.split(","))],
   [/^#\/review\/?$/, () => reviewView()],
   [/^#\/calibration\/?$/, () => calibrationView()],
 ];

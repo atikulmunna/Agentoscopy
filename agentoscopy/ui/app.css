@@ -201,6 +201,35 @@ a.well:focus-visible { outline-offset: 1px; }
 .ci .point { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
 .ci text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
+/* Cost and quality: frontier runs as filled dots in the series hue, beaten runs as gray rings,
+   so the two differ in shape as well as color. The chart scrolls rather than shrink its text. */
+.tradeoff { padding: 12px 16px 8px; }
+.tradeoff .legend { margin: 0 0 4px; }
+.tradeoff svg { display: block; width: 100%; min-width: 560px; max-width: 820px; height: auto; overflow: visible; }
+.tradeoff .grid { stroke: var(--hairline); stroke-width: 1; }
+.tradeoff .baseline { stroke: var(--axis); stroke-width: 1; }
+.tradeoff .tick { fill: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.tradeoff .title { fill: var(--ink-2); font-size: 13px; }
+.tradeoff .step { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.tradeoff .hit { fill: transparent; }
+.tradeoff .halo { fill: var(--surface); }
+/* A soft band rather than a hairline, so it shows on both sides of the step line it can share */
+.tradeoff .whisker { stroke-width: 8; stroke-linecap: round; opacity: 0.22; }
+.tradeoff .frontier .whisker { stroke: var(--series); }
+.tradeoff .beaten .whisker { stroke: var(--muted); }
+.tradeoff .frontier .dot { fill: var(--series); }
+.tradeoff .beaten .dot { fill: var(--surface); stroke: var(--muted); stroke-width: 2; }
+.tradeoff .name { fill: var(--ink); font-size: 14px; font-weight: 600; }
+.tradeoff .beaten .name { fill: var(--ink-2); font-weight: 400; }
+.tradeoff .point:hover .halo, .tradeoff .point:focus-visible .halo { stroke: var(--ink); stroke-width: 1.5; }
+.tradeoff .point:focus-visible { outline: none; }
+.swatch { display: inline-block; flex: none; }
+.swatch.frontier, .swatch.beaten { width: 10px; height: 10px; border-radius: 50%; }
+.swatch.frontier { background: var(--series); }
+.swatch.beaten { box-shadow: inset 0 0 0 2px var(--muted); }
+.swatch.step { width: 18px; height: 2px; background: var(--series); border-radius: 1px; }
+.swatch.whisker { width: 8px; height: 16px; background: var(--series); opacity: 0.3; border-radius: 4px; }
+
 /* Verdict banner: icon + label, never color alone */
 .verdict { display: flex; align-items: flex-start; gap: 14px; padding: 16px 20px; background: var(--surface); border: 1px solid var(--hairline); border-left-width: 4px; border-radius: 8px; margin: 12px 0 0; }
 .verdict .glyph { font-size: 22px; line-height: 1; margin-top: 3px; }
@@ -357,4 +386,8 @@ button.primary kbd { color: var(--accent); }
 @media (forced-colors: active) {
   .well.pass { background: CanvasText; }
   .well.fail { box-shadow: inset 0 0 0 2px CanvasText; }
+  .tradeoff .frontier .dot, .swatch.frontier, .swatch.step { fill: CanvasText; background: CanvasText; }
+  .tradeoff .step, .tradeoff .whisker { stroke: CanvasText; }
+  .tradeoff .beaten .dot { stroke: CanvasText; }
+  .swatch.beaten { box-shadow: inset 0 0 0 2px CanvasText; }
 }

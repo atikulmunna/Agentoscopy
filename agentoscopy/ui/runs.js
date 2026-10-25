@@ -23,20 +23,14 @@ export async function runsView() {
     ];
   }
   const selected = new Set();
-  const compare = h("button", { class: "primary", type: "button", disabled: true }, "Compare selected runs");
-  compare.addEventListener("click", () => {
-    const [baseline, candidate] = runs
-      .filter((run) => selected.has(run.run_id))
-      .sort((a, b) => a.created_at.localeCompare(b.created_at));
-    location.hash = `#/compare/${enc(baseline.run_id)}/${enc(candidate.run_id)}`;
-  });
+  const buttons = selectionButtons(runs, selected);
   const rows = runs.map((run) => {
     const box = h("input", { type: "checkbox", "aria-label": `Select run ${shortId(run.run_id)}` });
     box.addEventListener("change", () => {
       if (box.checked) selected.add(run.run_id);
       else selected.delete(run.run_id);
       box.closest("tr").classList.toggle("selected", box.checked);
-      compare.disabled = selected.size !== 2;
+      buttons.update();
     });
     const labels = Object.entries(run.labels || {}).map(([k, v]) => `${k}=${v}`).join(", ");
     return h(
@@ -59,14 +53,32 @@ export async function runsView() {
   };
   return [
     h("h1", {}, "Runs"),
-    h("p", { class: "lede" }, "Select two runs to compare them. The earlier run is the baseline."),
-    h("div", { class: "toolbar" }, compare),
+    h("p", { class: "lede" }, "Select two runs to compare them; the earlier run is the baseline. Select two or more to weigh pass rate against cost."),
+    buttons.toolbar,
     table(
       ["", "Run", "Started", "Suite", "Agent", "Status", "Pass rate", "95% CI", "Cost", "Labels"],
       rows,
       [6, 7, 8],
     ),
   ];
+}
+
+function selectionButtons(runs, selected) {
+  const chosen = () => runs.filter((run) => selected.has(run.run_id));
+  const compare = h("button", { class: "primary", type: "button", disabled: true }, "Compare selected runs");
+  compare.addEventListener("click", () => {
+    const [baseline, candidate] = chosen().sort((a, b) => a.created_at.localeCompare(b.created_at));
+    location.hash = `#/compare/${enc(baseline.run_id)}/${enc(candidate.run_id)}`;
+  });
+  const weigh = h("button", { type: "button", disabled: true }, "Compare cost and quality");
+  weigh.addEventListener("click", () => {
+    location.hash = `#/tradeoff/${chosen().map((run) => enc(run.run_id)).join(",")}`;
+  });
+  const update = () => {
+    compare.disabled = selected.size !== 2;
+    weigh.disabled = selected.size < 2;
+  };
+  return { toolbar: h("div", { class: "toolbar" }, compare, weigh), update };
 }
 
 export async function runView(runId) {
