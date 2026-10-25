@@ -66,6 +66,7 @@ uv run agentoscopy task import ../myrepo <commit> --id fix-x  # a task from a fi
 uv run agentoscopy run --suite example --agent configs/scripted-fix.yaml --trials 3
 uv run agentoscopy report <run_id> --format md          # table, md, or json
 uv run agentoscopy compare <baseline_run> <candidate_run>
+uv run agentoscopy tradeoff <run_id> <run_id> ...        # pass rate against cost, and the frontier
 uv run agentoscopy run --resume <run_id>                # continue a run after a crash
 uv run agentoscopy replay <trial_id>                    # rerun a trial from its recorded model calls
 uv run agentoscopy fork <trial_id> --at-step 3          # the same up to step 3, then live
@@ -149,6 +150,27 @@ critical tasks, false verdicts stay near 6% instead of rising to about 14%, whic
 also checks. The output also shows cost, token, step, and duration
 deltas, deltas by task category and tag, and a field-level diff of the two agent configs.
 
+## Cost against quality
+
+`agentoscopy tradeoff <run_id> <run_id> ...` weighs pass rate against cost across 2 to 20
+runs, and the web UI draws it when two or more runs are selected. It uses the tasks every
+run scored at the same version, so a run over easier tasks cannot look better than it is.
+For each run it gives the mean pass rate over those tasks, with the same 95% t interval
+comparisons use, and the mean agent cost per scored trial; judge spend is left out, as it
+is from budgets. A run is on the frontier when no other run passes at least as often for no
+more cost. The chart joins the frontier with a step line: the best pass rate each budget
+buys. The frontier compares point estimates, so where intervals overlap, the order may not
+hold. `--format` takes `table`, `md`, or `json`, and the API is `GET /tradeoff?runs=A,B,C`.
+
+![The cost and quality page for three agent configs on the core suite](docs/tradeoff.png)
+
+*Three real runs of the core suite, four trials per task. The example agent on Claude Haiku
+5.5 passes 26.3% of tasks at $0.0015 per trial, Claude Code on the same model 72.5% at
+$0.0020, and the example agent on Claude Sonnet 5.5 97.5% at $0.0116. None beats another on
+both, so all three are on the frontier. Each of Claude Code's 22 failures was a tamper veto
+for editing a protected test file, 20 of them on the tasks that ask for new code; its fixes
+passed the hidden tests in all 22.*
+
 ## Grading
 
 Each trial is graded in a fresh sandbox cloned from the agent's final state, with caches
@@ -205,9 +227,10 @@ incomplete, misread task, and so on) or any other word. The run dashboard and
 ## Web UI
 
 `agentoscopy serve` serves a UI on `127.0.0.1:8321`: the runs list (select two runs to
-compare them), a run dashboard with one well per trial, trial pages with the event
-timeline, graders, and filesystem diff, the comparison, side-by-side trajectories, the
-review queue, and judge calibration. Every API call needs the token in the printed URL,
+compare them, or two or more to weigh cost against quality), a run dashboard with one well
+per trial, trial pages with the event timeline, graders, and filesystem diff, the
+comparison, side-by-side trajectories, the cost and quality chart, the review queue, and
+judge calibration. Every API call needs the token in the printed URL,
 and requests for other host names are refused. Runs started from the CLI appear live.
 
 Runs can be started and cancelled over HTTP. `POST /runs` takes JSON with `agent` (the name
