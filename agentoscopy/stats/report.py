@@ -80,26 +80,31 @@ def _task_rows(summary: dict[str, Any]) -> list[tuple[str, ...]]:
 
 
 def _table(summary: dict[str, Any], run: dict[str, Any]) -> str:
-    header = _header(summary["k"])
-    rows = [header, *_task_rows(summary)]
-    widths = [max(len(row[index]) for row in rows) for index in range(len(header))]
-    lines = [
-        "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
-        for row in rows
-    ]
+    lines = _text_table(_header(summary["k"]), _task_rows(summary))
     return "\n".join([*_headline(summary, run), "", *lines])
 
 
 def _markdown(summary: dict[str, Any], run: dict[str, Any]) -> str:
-    header = _header(summary["k"])
-    table = [
-        "| " + " | ".join(header) + " |",
-        "|" + "---|" * len(header),
-        *("| " + " | ".join(row) + " |" for row in _task_rows(summary)),
-    ]
+    table = _markdown_table(_header(summary["k"]), _task_rows(summary))
     headline = [f"- {line}" for line in _headline(summary, run)[1:]]
     title = f"# Run {run['run_id']}"
     return "\n".join([title, "", *headline, "", *table])
+
+
+def _text_table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
+    widths = [max(len(row[i]) for row in [header, *rows]) for i in range(len(header))]
+    return [
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
+        for row in [header, *rows]
+    ]
+
+
+def _markdown_table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
+    return [
+        "| " + " | ".join(header) + " |",
+        "|" + "---|" * len(header),
+        *("| " + " | ".join(row) + " |" for row in rows),
+    ]
 
 
 def _pct(value: float | None) -> str:
@@ -116,19 +121,10 @@ def render_comparison(comparison: dict[str, Any], output_format: str) -> str:
     header = ("task", "class", "baseline", "candidate", "delta", "p(worse)", "cost delta")
     rows = [_comparison_row(task) for task in _ordered(comparison["tasks"])]
     if output_format == "md":
-        table = [
-            "| " + " | ".join(header) + " |",
-            "|" + "---|" * len(header),
-            *("| " + " | ".join(row) + " |" for row in rows),
-        ]
         title = f"# {comparison['verdict']}"
+        table = _markdown_table(header, rows)
         return "\n".join([title, "", *(f"- {line}" for line in lines[1:]), "", *table])
-    widths = [max(len(row[i]) for row in [header, *rows]) for i in range(len(header))]
-    table = [
-        "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
-        for row in [header, *rows]
-    ]
-    return "\n".join([*lines, "", *table])
+    return "\n".join([*lines, "", *_text_table(header, rows)])
 
 
 def render_ci_comment(comparison: dict[str, Any], *, overridden: bool, truncated: bool) -> str:
