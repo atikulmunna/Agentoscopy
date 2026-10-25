@@ -10,12 +10,13 @@ import pytest
 import yaml
 from conftest import calc_repo_with_fix, running_gateway
 
+from agentoscopy.adapters.command import CommandAgent
 from agentoscopy.adapters.python import load_python_adapter
 from agentoscopy.cli.main import main
 from agentoscopy.graders.judge import GatewayJudge
 from agentoscopy.recorder.trajectory import TrajectoryRecorder, read_events
 from agentoscopy.sandbox.docker import DockerBackend
-from agentoscopy.spec import load_agent_config, load_task
+from agentoscopy.spec import AgentConfig, load_agent_config, load_task
 from agentoscopy.storage.store import Store
 from agentoscopy.validation import validate_task
 from agentoscopy.worker.trial import AttemptResult, AttemptSpec, run_attempt
@@ -326,3 +327,58 @@ def test_an_imported_fix_commit_validates(tmp_path):
 
     assert main(["task", "import", str(repo.path), fix, "--id", "fix-add", *common]) == 0
     assert main(["task", "validate", "fix-add", *common]) == 0
+
+
+# A command agent in miniature: it calls the model through the relay, checks it is offline
+# and that its install step ran, and writes the fix only once a model answer came back.
+RELAYED_AGENT = """
+import json, os, socket, urllib.request
+request = urllib.request.Request(
+    os.environ["ANTHROPIC_BASE_URL"] + "/v1/messages",
+    data=json.dumps({"model": "mock", "max_tokens": 32,
+                     "messages": [{"role": "user", "content": "fix it"}]}).encode(),
+    headers={"content-type": "application/json", "x-api-key": os.environ["ANTHROPIC_API_KEY"]},
+)
+answer = json.load(urllib.request.urlopen(request))
+assert answer["content"], answer
+try:
+    socket.create_connection(("1.1.1.1", 53), timeout=3)
+    print("online")
+except OSError:
+    print("offline")
+print(open("/opt/agent-marker").read().strip())
+open("shop/pagination.py", "w").write(
+    "def paginate(items, page, per_page):\\n"
+    "    start = (page - 1) * per_page\\n"
+    "    return items[start:start + per_page]\\n"
+)
+"""
+
+
+def test_a_command_agent_reaches_the_model_only_through_the_relay(tmp_path):
+    config = AgentConfig(
+        name="relayed",
+        adapter="python",
+        entrypoint="agentoscopy.adapters.command:CommandAgent",
+        params={
+            "command": ["python3", "-c", RELAYED_AGENT],
+            "install": ["echo installed > /opt/agent-marker"],
+        },
+    )
+    spec = AttemptSpec(
+        run_id="integration", trial_id="it-relayed", attempt=1,
+        task=load_task(REPO / "tasks", TASK_ID), config=config, seed_key="it", judge_model="mock",
+    )  # fmt: skip
+
+    async def scenario():
+        async with running_gateway() as gateway:
+            return await run_attempt(spec, CommandAgent(), DockerBackend(), gateway, tmp_path)
+
+    result = asyncio.run(scenario())
+
+    assert (result.outcome, result.termination) == ("pass", "agent_done"), result.error
+    assert result.usage.steps == 1  # the model call went through the gateway
+    events = read_events(result.trajectory_path)
+    output = next(e["payload"]["stdout"] for e in events if e["type"] == "tool_result")
+    assert output.split() == ["offline", "installed"]
+    assert leftovers("ps", "it-relayed") == ""
