@@ -70,7 +70,7 @@ class RunInputs:
 
 
 @dataclass(frozen=True)
-class _TaskStats:
+class TaskStats:
     version: int
     n: int
     passes: int
@@ -100,7 +100,7 @@ def compare_runs(
     *,
     allow_version_drift: bool = False,
 ) -> dict[str, Any]:
-    base_tasks, cand_tasks = _task_stats(baseline.trials), _task_stats(candidate.trials)
+    base_tasks, cand_tasks = task_stats(baseline.trials), task_stats(candidate.trials)
     shared, excluded, warnings = _pair(base_tasks, cand_tasks, allow_version_drift)
     if not shared:
         raise CompareError("NO_SHARED_TASKS: the runs share no scored task versions")
@@ -162,14 +162,14 @@ def config_diff(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[dic
     return changes
 
 
-def _task_stats(trials: list[dict[str, Any]]) -> dict[str, _TaskStats]:
+def task_stats(trials: list[dict[str, Any]]) -> dict[str, TaskStats]:
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trial in trials:
         by_task[trial["task_id"]].append(trial)
     stats = {}
     for task_id, task_trials in by_task.items():
         scored = [trial for trial in task_trials if trial.get("outcome") in SCORED_OUTCOMES]
-        stats[task_id] = _TaskStats(
+        stats[task_id] = TaskStats(
             version=task_trials[0]["task_version"],
             n=len(scored),
             passes=sum(trial["outcome"] == "pass" for trial in scored),
@@ -190,7 +190,7 @@ def _task_stats(trials: list[dict[str, Any]]) -> dict[str, _TaskStats]:
 
 
 def _pair(
-    base: dict[str, _TaskStats], cand: dict[str, _TaskStats], allow_version_drift: bool
+    base: dict[str, TaskStats], cand: dict[str, TaskStats], allow_version_drift: bool
 ) -> tuple[list[str], dict[str, list[str]], list[str]]:
     excluded: dict[str, list[str]] = {
         "only_in_baseline": sorted(set(base) - set(cand)),
@@ -217,7 +217,7 @@ def _pair(
 
 
 def _task_row(
-    task_id: str, base: _TaskStats, cand: _TaskStats, spec: dict[str, Any]
+    task_id: str, base: TaskStats, cand: TaskStats, spec: dict[str, Any]
 ) -> dict[str, Any]:
     p_worse = fisher_worse(base.passes, base.n, cand.passes, cand.n)
     p_better = fisher_worse(cand.passes, cand.n, base.passes, base.n)
@@ -251,7 +251,7 @@ def _task_row(
     }
 
 
-def _classify(base: _TaskStats, cand: _TaskStats, p_worse: float, p_better: float) -> str:
+def _classify(base: TaskStats, cand: TaskStats, p_worse: float, p_better: float) -> str:
     # Compare rates exactly with integers: cand.passes / cand.n versus base.passes / base.n.
     direction = cand.passes * base.n - base.passes * cand.n
     if direction < 0 and p_worse < ALPHA:
@@ -300,7 +300,7 @@ def _verdict(ci: tuple[float, float], critical_regressions: list[str]) -> str:
     return "NO_SIGNIFICANT_CHANGE"
 
 
-def _run_header(inputs: RunInputs, shared: list[_TaskStats]) -> dict[str, Any]:
+def _run_header(inputs: RunInputs, shared: list[TaskStats]) -> dict[str, Any]:
     run = inputs.run
     return {
         "run_id": run["run_id"],
