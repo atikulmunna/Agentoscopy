@@ -43,12 +43,13 @@ a change made it better or worse, and how far to trust the answer:
   verdicts are sampled for human review, with each judge's agreement measured.
 
 It is also smaller. The bundled tasks are a starter suite for exercising the harness, not a
-benchmark, though `task import` turns fixes from your own repository's history into tasks.
+benchmark, though `task import` turns fixes from your own repository's history into tasks,
+and `task swebench` turns SWE-bench instances into tasks that grade the way SWE-bench does.
 Agents are Python classes, or command-line agents such as Claude Code run inside the
 sandbox, and models come from Anthropic or any server that speaks its API: open models on
-OpenRouter, or local ones on Ollama, llama.cpp, LM Studio, or vLLM. To rank models, use a
-benchmark such as SWE-bench; for a wide range of ready-made evaluations, Inspect; to gate
-changes to one agent, Agentoscopy.
+OpenRouter, or local ones on Ollama, llama.cpp, LM Studio, or vLLM. To rank models on a
+leaderboard, use a benchmark's own harness, such as SWE-bench's; for a wide range of
+ready-made evaluations, Inspect; to gate changes to one agent, Agentoscopy.
 
 ## Setup
 
@@ -64,6 +65,7 @@ uv sync
 uv run agentoscopy task validate --all                  # build images, run null/reference/isolation checks
 uv run agentoscopy task list                            # validation status of every task
 uv run agentoscopy task import ../myrepo <commit> --id fix-x  # a task from a fix in your repo's history
+uv run agentoscopy task swebench verified.jsonl django__django-11099  # a task from a SWE-bench row
 uv run agentoscopy run --suite example --agent configs/scripted-fix.yaml --trials 3
 uv run agentoscopy report <run_id> --format md          # table, md, or json
 uv run agentoscopy compare <baseline_run> <candidate_run>
@@ -372,6 +374,8 @@ A task lives in `tasks/<id>/`:
 - `fixtures/`: copied into the workdir when the task image is built
 - `hidden/`: grader-only files, mounted read-only at `/hidden` during grading only
 - `reference/`: optional reference solution; its files overlay the workdir during validation
+- `reference.patch`: optional reference solution as a diff, applied with `git apply` in the
+  workdir during validation, for an image that has git
 
 Suites live in `suites/<name>.yaml` as a name and a list of task ids, a list of `tags`, or
 both: a suite with tags also takes every task that carries one of them, after the listed
@@ -404,6 +408,49 @@ tests, changes only tests, or deletes code is refused, and so is one whose test 
 share a name, because hidden tests are flattened into one folder. As a check, a fix from
 this project's own history (`8b1b0e7`, with `--runner pytest --build "pip install ."`)
 imports into a task that validates.
+
+### Tasks from SWE-bench
+
+`agentoscopy task swebench <rows> <instance_id>...`, or `--all`, turns rows of SWE-bench,
+SWE-bench Lite, or SWE-bench Verified into tasks. Rows come from a local `.json` or `.jsonl`
+file, from SWE-bench 5 or later, whose rows name each instance's image, eval script, and log
+parser. One way to get them:
+
+```sh
+uv run --with datasets python -c "from datasets import load_dataset; load_dataset('SWE-bench/SWE-bench_Verified', split='test').to_json('verified.jsonl')"
+uv run agentoscopy task swebench verified.jsonl django__django-11099 sympy__sympy-20590
+uv run agentoscopy task validate django-django-11099 sympy-sympy-20590
+```
+
+Each task:
+
+- starts from SWE-bench's image for the instance, pinned by digest, with the repository at
+  `/testbed` as the workdir and its Python environment first on `PATH`
+  (`environment.env`, which any task can use to set variables in its image);
+- is graded by running the row's eval script, which applies the hidden tests and runs them,
+  then grading the log the way SWE-bench does. Its log parsers and rules are ported into a
+  check that runs in the grading sandbox: the instance is resolved when every FAIL_TO_PASS
+  test passes and every PASS_TO_PASS test still passes or is skipped;
+- has SWE-bench's gold patch as its `reference.patch`, so validation checks that the
+  untouched repository fails and the gold patch passes, which proves the task grades as
+  SWE-bench does;
+- keeps the tamper check for `conftest.py` files, is tagged `swe-bench`, and takes the
+  repository as its category and Verified's time estimate as its difficulty.
+
+Importing looks up each image's digest; the images, about 4 GB each on disk, are pulled when
+a task is first validated or run. Only Python repositories are supported. Graders run as
+the agent's non-root user, where SWE-bench runs them as root, so code the agent wrote cannot
+reach the Python that reads the log; steps of an eval script that need root, such as
+generating a locale, run once when the image is built. The check is also stricter in one
+place: a log in which the hidden tests did not apply is not graded, since it would grade
+whatever tests were there.
+
+Checked for real on three SWE-bench Verified instances, one for each kind of log parser:
+`django__django-11099`, `sympy__sympy-20590`, and `astropy__astropy-12907` all validate, so
+each fails untouched and passes with the gold patch, as in SWE-bench. The example agent on
+Qwen3-Coder-30B-A3B through OpenRouter then resolved the Django and Astropy instances but
+not the SymPy one, for $0.116 recorded and $0.119 billed, and the tamper check passed in
+all three trials.
 
 ## Replay and fork
 
