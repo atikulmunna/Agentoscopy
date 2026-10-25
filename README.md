@@ -163,14 +163,16 @@ more cost. The chart joins the frontier with a step line: the best pass rate eac
 buys. The frontier compares point estimates, so where intervals overlap, the order may not
 hold. `--format` takes `table`, `md`, or `json`, and the API is `GET /tradeoff?runs=A,B,C`.
 
-![The cost and quality page for three agent configs on the core suite](docs/tradeoff.png)
+![The cost and quality page for four agent configs on the core suite](docs/tradeoff.png)
 
-*Three real runs of the core suite, four trials per task. The example agent on Claude Haiku
-5.5 passes 26.3% of tasks at $0.0015 per trial, Claude Code on the same model 72.5% at
-$0.0020, and the example agent on Claude Sonnet 5.5 97.5% at $0.0116. None beats another on
-both, so all three are on the frontier. Each of Claude Code's 22 failures was a tamper veto
-for editing a protected test file, 20 of them on the tasks that ask for new code; its fixes
-passed the hidden tests in all 22.*
+*Four real runs of the core suite, four trials per task. The example agent on Claude Haiku
+5.5 passes 26.3% of tasks at $0.0015 per trial, the same agent on the open model
+Qwen3-Coder-30B-A3B through OpenRouter 71.3% at $0.0016, Claude Code on Haiku 72.5% at
+$0.0020, and the example agent on Claude Sonnet 5.5 97.5% at $0.0116. Each passes more often
+than the cheaper ones, so all four are on the frontier, though the open model and Claude Code
+are level within their intervals. Each of Claude Code's 22 failures was a tamper veto for
+editing a protected test file, 20 of them on the tasks that ask for new code; its fixes passed
+the hidden tests in all 22.*
 
 ## Grading
 
@@ -320,12 +322,14 @@ Command-line agents name provider models the same way, for example Claude Code w
 `--judge-model ollama/<model>`, though a small model makes a poor judge; the
 [calibration report](#human-review-and-judge-calibration) shows how far to trust it.
 
-Checked for real with the example agent on `qwen/qwen3-coder-30b-a3b-instruct` through
-OpenRouter: `agent check` passed with 5 model calls for $0.0002, and on three core tasks it
-passed 4 of 6 trials for $0.003 in all. Both failures were tamper vetoes for editing a
-protected test file, and its key never reached the recorded trajectories. A run reserves
-each trial's `max_cost_usd` (a task's cap, $1 by default) before starting it, so with a
-model this cheap, a run budget near $1 leaves room for only one trial at a time.
+Checked for real with the example agent on `qwen/qwen3-coder-30b-a3b-instruct:floor`
+through OpenRouter, priced as above: over the core suite, four trials per task, it passed
+71.3% of tasks (the open model on the [cost and quality chart](#cost-against-quality)). The
+run was recorded at $0.1241 and OpenRouter billed $0.1245 for it. 14 of its 23 failures were
+tamper vetoes for editing a protected test file, and its key never reached the recorded
+results. A run reserves each trial's `max_cost_usd` (a task's cap, $1 by default) before
+starting it, so the run budget must cover that cap on top of what the run spends; this one
+used `--budget-usd 1.3`.
 
 ### Command-line agents
 
