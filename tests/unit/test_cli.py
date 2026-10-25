@@ -94,6 +94,21 @@ def test_report_prints_a_stored_run(tasks_dir, tmp_path, capsys):
     assert agentoscopy(tmp_path, tasks_dir, "report", "missing-run") == EXIT_INVALID_INPUT
 
 
+def test_tradeoff_refuses_runs_it_cannot_weigh(tasks_dir, tmp_path, capsys):
+    store = Store(tmp_path / "home" / "agentoscopy.db")
+    config = AgentConfig(name="agent", adapter="python", entrypoint="pkg.mod:Agent")
+    settings = RunSettings(None, None, 1, None, 5, 1, "test")
+    first, second = (
+        store.create_run(config, settings, [NewTrial("task-a", 1, 0, 0, 1.0)]) for _ in range(2)
+    )
+    store.close()
+
+    assert agentoscopy(tmp_path, tasks_dir, "tradeoff", first, second) == EXIT_INVALID_INPUT
+    assert "NO_SHARED_TASKS" in capsys.readouterr().err  # neither run has scored a trial yet
+    assert agentoscopy(tmp_path, tasks_dir, "tradeoff", first, "missing") == EXIT_INVALID_INPUT
+    assert "no run missing" in capsys.readouterr().err
+
+
 JUDGED = {"name": "quality", "type": "llm_judge", "rubric": "Minimal?", "required": False}
 
 

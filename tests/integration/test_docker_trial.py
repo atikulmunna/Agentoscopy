@@ -182,6 +182,11 @@ def test_cli_validates_then_runs_the_example_suite(tmp_path, capsys):
     # 2 of 2 to 0 of 2 is a real drop, but too few trials for the per-task test to call it.
     assert f"{TASK_ID}  changed" in compared
 
+    assert main(["tradeoff", candidate, baseline, tampered, *common]) == 0
+    weighed = capsys.readouterr().out
+    assert "over 1 shared task," in weighed
+    assert [line.split()[0] for line in weighed.splitlines() if line.endswith(" yes")]
+
 
 def test_a_killed_run_is_resumed_and_its_orphaned_sandboxes_removed(tmp_path):
     """Acceptance criterion 4 on Docker: kill `agentoscopy run` mid-trial, then resume it."""

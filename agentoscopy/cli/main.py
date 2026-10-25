@@ -32,12 +32,12 @@ from agentoscopy.cli.manage import cancel_command, gc_command
 from agentoscopy.cli.run import fork_command, replay_command, run_command, start_proxy
 from agentoscopy.cli.validate import validate_command
 from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
-from agentoscopy.reporting import NotFound, comparison, run_summary
+from agentoscopy.reporting import NotFound, comparison, run_summary, tradeoff
 from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.scheduler.runner import REVIEW_RATE
 from agentoscopy.spec import SpecError, all_task_ids, load_task
 from agentoscopy.stats.compare import CompareError
-from agentoscopy.stats.report import FORMATS, render, render_comparison
+from agentoscopy.stats.report import FORMATS, render, render_comparison, render_tradeoff
 from agentoscopy.storage.store import Store
 from agentoscopy.task_import import DEFAULT_BASE_IMAGE, RUNNERS
 
@@ -308,7 +308,7 @@ def _add_ci_command(
 def _add_report_commands(
     commands: argparse._SubParsersAction, common: argparse.ArgumentParser
 ) -> None:
-    """`report` and `compare`."""
+    """`report`, `compare`, and `tradeoff`."""
     report = commands.add_parser("report", parents=[common], help="print a run summary")
     report.add_argument("run_id")
     report.add_argument("--format", choices=FORMATS, default="table")
@@ -324,6 +324,13 @@ def _add_report_commands(
         help="also compare tasks whose versions differ between the runs",
     )
     compare.set_defaults(handler=_compare_command)
+
+    weigh = commands.add_parser(
+        "tradeoff", parents=[common], help="pass rate against cost across runs, with the frontier"
+    )
+    weigh.add_argument("run_ids", nargs="+", metavar="run_id", help="two or more run ids")
+    weigh.add_argument("--format", choices=FORMATS, default="table")
+    weigh.set_defaults(handler=_tradeoff_command)
 
 
 def _add_serve_command(
@@ -414,6 +421,19 @@ def _compare_command(args: argparse.Namespace) -> int:
     finally:
         store.close()
     print(render_comparison(result, args.format))
+    return EXIT_OK
+
+
+def _tradeoff_command(args: argparse.Namespace) -> int:
+    store = Store(args.home / DB_NAME)
+    try:
+        result = tradeoff(store, args.run_ids)
+    except (NotFound, CompareError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INVALID_INPUT
+    finally:
+        store.close()
+    print(render_tradeoff(result, args.format))
     return EXIT_OK
 
 

@@ -1,4 +1,5 @@
-"""REST API (§7.2) and web UI host (§7.5): runs, trials, comparisons, and human review.
+"""REST API (§7.2) and web UI host (§7.5): runs, trials, comparisons, cost against quality
+tradeoffs, and human review.
 
 Every API route needs the server's token (`Authorization: Bearer <token>`; `/events` also
 accepts `?token=`, since browsers cannot set headers on an EventSource). Requests must name a
@@ -32,7 +33,7 @@ from agentoscopy.api.runs import RunService
 from agentoscopy.launch import Directories
 from agentoscopy.metrics import CONTENT_TYPE, render_metrics
 from agentoscopy.recorder.trajectory import read_events
-from agentoscopy.reporting import NotFound, comparison, run_summary, safe_artifact
+from agentoscopy.reporting import NotFound, comparison, run_summary, safe_artifact, tradeoff
 from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.stats.compare import CompareError
 from agentoscopy.storage.store import Store
@@ -67,6 +68,7 @@ def create_app(
     app.router.add_get("/trials/{trial_id}/trajectory", _get_trajectory)
     app.router.add_get("/trials/{trial_id}/diff", _get_diff)
     app.router.add_get("/compare", _compare)
+    app.router.add_get("/tradeoff", _tradeoff)
     app.router.add_get("/events", _events)
     app.router.add_get("/metrics", _metrics)
     reviews.add_routes(app)
@@ -171,6 +173,13 @@ async def _compare(request: web.Request) -> web.Response:
     drift = request.query.get("allow_version_drift", "").lower() in ("1", "true", "yes")
     result = comparison(request.app[STORE], base, cand, allow_version_drift=drift)
     return web.json_response(result)
+
+
+async def _tradeoff(request: web.Request) -> web.Response:
+    run_ids = [part.strip() for part in request.query.get("runs", "").split(",") if part.strip()]
+    if not run_ids:
+        raise ApiError(400, "BAD_REQUEST", "runs is required: comma-separated run ids")
+    return web.json_response(tradeoff(request.app[STORE], run_ids))
 
 
 async def _metrics(request: web.Request) -> web.Response:

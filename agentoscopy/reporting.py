@@ -1,5 +1,5 @@
-"""Builds summaries, comparisons, calibration reports, and review items from the store, for
-the CLI and the API."""
+"""Builds summaries, comparisons, cost against quality tradeoffs, calibration reports, and
+review items from the store, for the CLI and the API."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from agentoscopy.recorder.trajectory import action_lines, read_events
 from agentoscopy.stats.calibration import calibrate
 from agentoscopy.stats.compare import RunInputs, compare_runs
 from agentoscopy.stats.summary import summarize
+from agentoscopy.stats.tradeoff import check_run_count, tradeoff_runs
 from agentoscopy.storage.store import Store
 
 
@@ -51,6 +52,12 @@ def comparison(
         _inputs(store, candidate_id),
         allow_version_drift=allow_version_drift,
     )
+
+
+def tradeoff(store: Store, run_ids: list[str]) -> dict[str, Any]:
+    unique = list(dict.fromkeys(run_ids))  # a run named twice is still one point
+    check_run_count(len(unique))
+    return tradeoff_runs([_inputs(store, run_id) for run_id in unique])
 
 
 def calibration(store: Store) -> list[dict[str, Any]]:

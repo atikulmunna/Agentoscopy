@@ -179,6 +179,21 @@ def test_compare_endpoint(world):
     assert not_found == 404
 
 
+def test_tradeoff_endpoint(world):
+    runs = f"{world.candidate}, {world.baseline},{world.baseline}"  # spaces and repeats are fine
+    _, result = call(world, f"/tradeoff?runs={runs}")
+    missing, no_runs = call(world, "/tradeoff?runs=,")
+    alone, one_run = call(world, f"/tradeoff?runs={world.baseline}")
+    not_found, _ = call(world, f"/tradeoff?runs={world.baseline},nope")
+
+    points = {point["config_name"]: point for point in result["runs"]}
+    assert (points["fixer"]["pass_rate"], points["idler"]["pass_rate"]) == (1.0, 0.0)
+    assert points["fixer"]["on_frontier"] and result["shared_tasks"] == 4
+    assert (missing, no_runs["error"]["code"]) == (400, "BAD_REQUEST")
+    assert (alone, one_run["error"]["code"]) == (422, "RUN_COUNT")
+    assert not_found == 404
+
+
 def test_events_stream_reports_run_progress(world):
     async def first_event(response):
         lines = []
