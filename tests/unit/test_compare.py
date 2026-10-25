@@ -267,6 +267,17 @@ def test_the_comment_counts_shared_tasks_in_words(count, phrase):
     assert phrase in render_ci_comment(result, overridden=False, truncated=False)
 
 
+def test_the_comment_rounds_a_tied_drop_away_from_zero_as_the_web_ui_does():
+    baseline = {f"t{i}": task(PASS4) for i in range(20)}
+    candidate = baseline | {"t0": task(["pass", "pass", "pass", "fail"])}
+    result = compare_runs(run_inputs("b", baseline), run_inputs("c", candidate))
+
+    # One task in 20 drops by 25 points: -1.25 points across the suite.
+    assert "delta pass rate -1.3 points" in render_ci_comment(
+        result, overridden=False, truncated=False
+    )
+
+
 def test_a_config_compared_with_itself_rarely_gives_a_verdict():
     """Acceptance criterion 6: of 100 self-comparisons (a 20-task suite without critical
     tasks, 3 trials each, seeded noise), at most 10 may give a verdict other than

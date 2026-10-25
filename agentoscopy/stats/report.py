@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 FORMATS = ("table", "md", "json")
@@ -108,7 +109,13 @@ def _markdown_table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> lis
 
 
 def _pct(value: float | None) -> str:
-    return "-" if value is None else f"{value * 100:.1f}%"
+    return "-" if value is None else f"{_tenths(value * 100)}%"
+
+
+def _tenths(value: float) -> Decimal:
+    """One decimal place, ties rounded away from zero as the web UI's toFixed rounds them, so
+    both show 57 of 80 as 71.3%; format's .1f rounds ties to even and would show 71.2%."""
+    return Decimal(value).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
 
 
 CLASS_ORDER = ("regressed", "improved", "changed", "flaky", "stable_pass", "stable_fail")
@@ -231,7 +238,7 @@ def _ordered(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _points(value: float) -> str:
-    return f"{value * 100:+.1f} points"
+    return f"{_tenths(value * 100):+} points"
 
 
 def _signed(value: float | None, prefix: str, digits: int) -> str:

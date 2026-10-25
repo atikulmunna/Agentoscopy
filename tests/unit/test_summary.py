@@ -105,6 +105,20 @@ def test_reports_render_in_every_format(output_format):
         assert "pass@2" in text and "50.0%" in text
 
 
+def test_reports_round_a_tie_up_as_the_web_ui_does():
+    summary = summarize(rows("task-a", "pass"), trials_per_task=1, seed=1, spent_usd=0.1)
+    summary |= {"macro_pass_rate": 57 / 80, "macro_ci_95": [21 / 80, 0.7124]}
+    run = {
+        "run_id": "r1", "suite_id": None, "config_name": "agent", "trials_per_task": 1,
+        "seed": 1, "status": "completed", "flags": [],
+    }  # fmt: skip
+
+    text = render(summary, run, "table")
+
+    # 71.25% and 26.25% are ties; 71.24% is not.
+    assert "macro pass rate 71.3% (95% CI 26.3% to 71.2%)" in text
+
+
 def test_summary_slices_by_task_metadata():
     trials = rows("a", "pass", "pass") + rows("b", "fail", "fail") + rows("c", "pass", "fail")
     specs = {
