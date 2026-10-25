@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from agentoscopy.graders.base import GraderError, Judge
 from agentoscopy.graders.fsdiff import since_baseline
@@ -16,6 +17,7 @@ CHECK_FAILURE_CODES = frozenset(
     {"GRADER_PASSES_EMPTY_ENV", "REFERENCE_FAILS", "HIDDEN_FILE_EXPOSED", "GRADER_UNSTABLE"}
 )
 JUDGE_VOTES = 3  # validation asks each judge three times and takes the majority (WF-01 A2)
+PATCH_IN_SANDBOX = "/tmp/agentoscopy-reference.patch"
 
 
 class ValidationFailed(Exception):
@@ -53,7 +55,7 @@ async def validate_task(
         report.image_digest = await backend.prepare_image(task)
         await _null_check(task, backend, report.image_digest, grade)
         report.verified_graders = await _reference_check(task, backend, report.image_digest, grade)
-        if not task.reference_files():
+        if not task.reference_files() and task.reference_patch is None:
             report.flags.append("NO_REFERENCE")
         if all(g.type == "llm_judge" for g in task.spec.graders if g.required):
             report.flags.append("SOFT_GRADER_ONLY")
@@ -90,16 +92,31 @@ async def _reference_check(
     """Apply the reference solution and require a pass, tamper check included; returns the
     graders it verified."""
     files = task.reference_files()
-    if not files:
+    if not files and task.reference_patch is None:
         return []
     sandbox, baseline = await _fresh_sandbox(task, backend, image, grade.sandboxes)
     for file in files:
         await sandbox.write_file(file.relative_to(task.reference_dir).as_posix(), file.read_bytes())
+    if task.reference_patch is not None:
+        await _apply_patch(sandbox, task.reference_patch)
     graded = await grade(sandbox, baseline)
     if not graded.passed:
         failing = [grade.name for grade in graded.grades if not grade.passed]
         raise ValidationFailed("REFERENCE_FAILS", f"reference solution fails graders: {failing}")
     return [grade.name for grade in graded.grades]
+
+
+async def _apply_patch(sandbox: ManagedSandbox, patch: Path) -> None:
+    """Apply the reference patch in the workdir with git, which the image must have."""
+    await sandbox.write_file(PATCH_IN_SANDBOX, patch.read_bytes())
+    applied = await sandbox.exec(
+        f"git apply --whitespace=nowarn {PATCH_IN_SANDBOX} && rm {PATCH_IN_SANDBOX}"
+    )
+    if applied.exit_code != 0:
+        detail = (applied.stderr or applied.stdout).decode("utf-8", "replace").strip()
+        raise ValidationFailed(
+            "REFERENCE_FAILS", f"the reference patch does not apply: {detail[-1000:]}"
+        )
 
 
 def _host_isolation_check(task: Task) -> None:

@@ -5,7 +5,7 @@ from conftest import BASE_TASK, SetupBackend
 from agentoscopy.graders.base import JudgeVerdictResult
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.testing.fake_sandbox import FakeBackend, exit_with
-from agentoscopy.validation import validate_task
+from agentoscopy.validation import PATCH_IN_SANDBOX, validate_task
 
 REFERENCE = {"reference/app.py": "fixed"}
 
@@ -28,6 +28,46 @@ def test_sound_task_with_reference_validates(make_task):
     assert report.image_digest == "fake-image"
     assert report.flags == []
     assert all(box.destroyed for box in backend.agent_sandboxes + backend.grading_sandboxes)
+
+
+def patch_in_sandbox(applies):
+    """Agent sandboxes where `git apply` succeeds or not; the hidden mount is absent."""
+    stderr = b"" if applies else b"error: patch failed: app.py:1"
+    return lambda cmd: ExecResult(
+        1 if cmd.startswith("test -e") or (cmd.startswith("git apply") and not applies) else 0,
+        b"",
+        stderr if cmd.startswith("git apply") else b"",
+    )
+
+
+def passes_when_patched(cmd, files):
+    return ExecResult(0 if PATCH_IN_SANDBOX in files else 1, b"", b"")
+
+
+PATCH = {"reference.patch": "--- a/app.py\n"}
+
+
+def test_a_reference_patch_is_applied_with_git(make_task):
+    backend = FakeBackend(agent_handler=patch_in_sandbox(True), grader=passes_when_patched)
+    task = make_task(files=PATCH)
+
+    report = validate(task, backend)
+
+    assert report.ok, report.message
+    assert report.verified_graders == ["tests"] and report.flags == []
+    patched = backend.agent_sandboxes[-1]
+    assert patched.files[PATCH_IN_SANDBOX] == (task.path / "reference.patch").read_bytes()
+    assert any(cmd.startswith(f"git apply --whitespace=nowarn {PATCH_IN_SANDBOX}")
+               for cmd in patched.commands)  # fmt: skip
+
+
+def test_a_reference_patch_that_does_not_apply_is_rejected(make_task):
+    backend = FakeBackend(agent_handler=patch_in_sandbox(False), grader=passes_when_patched)
+
+    report = validate(make_task(files=PATCH), backend)
+
+    assert report.error_code == "REFERENCE_FAILS"
+    assert "does not apply: error: patch failed: app.py:1" in report.message
 
 
 def test_task_without_reference_validates_unverified(make_task):

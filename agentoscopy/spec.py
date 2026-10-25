@@ -16,6 +16,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 TASK_FILE = "task.yaml"
+REFERENCE_PATCH = "reference.patch"  # a reference solution as a diff, applied with git
 SLUG_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 IGNORED_DIR_NAMES = frozenset({"__pycache__"})
 
@@ -258,6 +259,12 @@ class Task:
     def reference_files(self) -> list[Path]:
         return _files_under(self.reference_dir)
 
+    @property
+    def reference_patch(self) -> Path | None:
+        """A reference solution given as a diff against the workdir, if the task has one."""
+        path = self.path / REFERENCE_PATCH
+        return path if path.is_file() else None
+
 
 def load_task(tasks_dir: Path, task_id: str) -> Task:
     _check_slug("task id", task_id)
@@ -342,16 +349,19 @@ def _field_path(loc: tuple[int | str, ...]) -> str:
 
 
 def _task_hash(spec: TaskSpec, task_dir: Path) -> str:
-    """SHA-256 over the normalised spec plus every fixture, hidden, and reference file."""
+    """SHA-256 over the normalised spec plus every fixture, hidden, and reference file, and
+    the reference patch."""
     # Defaults are left out, so adding an optional field later does not version every task.
     digest = hashlib.sha256(
         _sha256_json(spec.model_dump(mode="json", exclude_defaults=True)).encode()
     )
-    for folder in ("fixtures", "hidden", "reference"):
-        for file in _files_under(task_dir / folder):
-            relative = file.relative_to(task_dir).as_posix()
-            file_digest = hashlib.sha256(file.read_bytes()).hexdigest()
-            digest.update(f"{relative}\0{file_digest}\n".encode())
+    files = [file for folder in ("fixtures", "hidden", "reference")
+             for file in _files_under(task_dir / folder)]  # fmt: skip
+    patch = task_dir / REFERENCE_PATCH
+    for file in [*files, patch] if patch.is_file() else files:
+        relative = file.relative_to(task_dir).as_posix()
+        file_digest = hashlib.sha256(file.read_bytes()).hexdigest()
+        digest.update(f"{relative}\0{file_digest}\n".encode())
     return digest.hexdigest()
 
 

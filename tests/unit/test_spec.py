@@ -156,6 +156,19 @@ def test_reference_files_are_part_of_the_content_hash(write_task, tasks_dir):
     assert [path.name for path in before.reference_files()] == ["app.py"]
 
 
+def test_a_reference_patch_is_part_of_the_content_hash(write_task, tasks_dir):
+    without = load_task(tasks_dir, write_task().name)
+    assert without.reference_patch is None
+    task_dir = write_task(files={"reference.patch": "--- a/app.py\n"})
+    with_patch = load_task(tasks_dir, "demo-task")
+
+    (task_dir / "reference.patch").write_text("--- a/app.py\n+++ b/app.py\n", encoding="utf-8")
+
+    assert with_patch.reference_patch == task_dir / "reference.patch"
+    assert len({without.content_hash, with_patch.content_hash,
+                load_task(tasks_dir, "demo-task").content_hash}) == 3  # fmt: skip
+
+
 def write_suite(tmp_path: Path, name: str, text: str) -> Path:
     suites_dir = tmp_path / "suites"
     suites_dir.mkdir(exist_ok=True)
