@@ -37,7 +37,13 @@ class _PriceSpec(BaseModel):
 
     input: float = Field(ge=0)  # USD per million tokens, like pricing.PRICES
     output: float = Field(ge=0)
-    cache_read: float = Field(default=0.0, ge=0)
+    # Left out, cache reads cost the same as input: OpenRouter bills them that way when a
+    # model's providers give no discount, and a budget should never undercount.
+    cache_read: float | None = Field(default=None, ge=0)
+
+    def price(self) -> Price:
+        cache_read = self.input if self.cache_read is None else self.cache_read
+        return Price(self.input, self.output, cache_read)
 
 
 class _ProviderSpec(BaseModel):
@@ -158,7 +164,7 @@ def load_providers(path: Path | None, environ: Mapping[str, str] = os.environ) -
         name: Provider(
             provider.base_url,
             provider.api_key_env,
-            {model: Price(**price.model_dump()) for model, price in provider.prices.items()},
+            {model: price.price() for model, price in provider.prices.items()},
         )
         for name, provider in spec.providers.items()
     }

@@ -50,13 +50,25 @@ def test_models_are_routed_by_provider_prefix(tmp_path):
 
     assert providers.route("ollama/qwen3:8b") == Route("ollama", "qwen3:8b", FREE)
     assert providers.route("openrouter/qwen/qwen3-coder") == Route(
-        "openrouter", "qwen/qwen3-coder", Price(0.2, 0.8, 0.0)
+        "openrouter", "qwen/qwen3-coder", Price(0.2, 0.8, 0.2)
     )
     assert providers.route("openrouter/qwen/unlisted") is None  # no "*" price there
     assert providers.route("claude-haiku-5-5").provider == ANTHROPIC
     assert providers.route("mock").provider == MOCK
     assert providers.route("elsewhere/model") is None
     assert providers.configured["ollama"].base_url == "http://localhost:11434"
+
+
+def test_cache_reads_cost_the_input_price_unless_the_file_lists_one(tmp_path):
+    prices = {
+        "discounted": {"input": 1, "output": 4, "cache_read": 0.1},
+        "undiscounted": {"input": 1, "output": 4},
+    }
+    hosted = {"base_url": "https://example.com", "prices": prices}
+    providers = load_providers(write(tmp_path, {"providers": {"hosted": hosted}}), {})
+
+    assert providers.route("hosted/discounted").price == Price(1, 4, 0.1)
+    assert providers.route("hosted/undiscounted").price == Price(1, 4, 1)
 
 
 @pytest.mark.parametrize(

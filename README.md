@@ -289,16 +289,21 @@ providers:
     base_url: https://openrouter.ai/api
     api_key_env: OPENROUTER_API_KEY
     prices:                             # USD per million tokens; check OpenRouter's page
-      qwen/qwen3-coder: {input: 0.30, output: 1.00}
+      qwen/qwen3-coder-30b-a3b-instruct:floor: {input: 0.07, output: 0.28}
 ```
 
 The gateway strips the provider's name from the model before it forwards a call, and
-enforces budgets and records calls as it does for Claude. Every call is budgeted, so a
-model without a price is refused; `"*"` prices every model a provider does not list. A
-server that needs a key gets it from the credential proxy, which takes it out of the
-`agentoscopy` process like `ANTHROPIC_API_KEY`, and a key is never sent over plain HTTP to a
-remote host. A server that needs no key, such as a local one, is called directly. Local
-models are counted as free, so their trials are limited by steps and tokens, not cost.
+enforces budgets and records calls as it does for Claude. Every call is budgeted, so a model
+without a price is refused; `"*"` prices every model a provider does not list, and cache
+reads cost the same as input unless a price gives `cache_read`. A server that needs a key
+gets it from the credential proxy, which takes it out of the `agentoscopy` process like
+`ANTHROPIC_API_KEY`, and a key is never sent over plain HTTP to a remote host. A server that
+needs no key, such as a local one, is called directly. Local models are counted as free, so
+their trials are limited by steps and tokens, not cost.
+
+OpenRouter spreads a model's calls over the providers that serve it, each at its own price,
+so a recorded cost is only as exact as the price listed; `:floor` on the model sends calls
+to the cheapest provider first, falling back to the others only when it fails.
 
 To evaluate a local model with Ollama, pull one that can call tools and serve it with
 enough context for a coding session:
