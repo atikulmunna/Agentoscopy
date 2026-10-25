@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from conftest import BASE_TASK, running_gateway
 
+from agentoscopy.gateway.providers import Providers
 from agentoscopy.launch import Directories, resume_run
 from agentoscopy.scheduler.plan import pin_tasks, plan_trials
 from agentoscopy.scheduler.runner import RunExecutor
@@ -51,7 +52,7 @@ def new_run(store, tasks_dir):
 def execute_here(store, home, tasks_dir, run_id):
     """Run (or resume) the run in this process, as `agentoscopy run --resume` would."""
     prepared = resume_run(
-        store, Directories(tasks_dir, tasks_dir, home), run_id, has_credentials=False
+        store, Directories(tasks_dir, tasks_dir, home), run_id, providers=Providers()
     )
     from orchestrator import passes_when_fixed
 

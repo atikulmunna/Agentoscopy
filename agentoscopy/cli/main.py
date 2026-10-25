@@ -29,7 +29,7 @@ from agentoscopy.cli.common import (
 )
 from agentoscopy.cli.importer import import_command
 from agentoscopy.cli.manage import cancel_command, gc_command
-from agentoscopy.cli.run import fork_command, replay_command, run_command, start_proxy
+from agentoscopy.cli.run import connect_models, fork_command, replay_command, run_command
 from agentoscopy.cli.validate import validate_command
 from agentoscopy.launch import DEFAULT_JUDGE_MODEL, Directories
 from agentoscopy.reporting import NotFound, comparison, run_summary, tradeoff
@@ -63,6 +63,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--tasks-dir", type=Path, default=Path("tasks"))
     common.add_argument("--suites-dir", type=Path, default=Path("suites"))
+    common.add_argument(
+        "--providers",
+        type=Path,
+        help="model providers besides Anthropic (default: providers.yaml, if it exists)",
+    )
     run_options = _run_options()
 
     parser = argparse.ArgumentParser(
@@ -438,8 +443,8 @@ def _tradeoff_command(args: argparse.Namespace) -> int:
 
 
 def _serve_command(args: argparse.Namespace) -> int:
-    proxy, failure = start_proxy()  # runs started over the API may call real models
-    if failure is not None:
+    models, failure = connect_models(args)  # runs started over the API may call real models
+    if models is None:
         return failure
     store = Store(args.home / DB_NAME)
     token = os.environ.get(TOKEN_ENV) or secrets.token_urlsafe(24)
@@ -447,7 +452,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         Directories(args.tasks_dir.resolve(), args.suites_dir.resolve(), args.home),
         args.configs_dir.resolve(),
         DockerBackend(),
-        proxy,
+        models,
     )
     app = create_app(store, args.home, token, frozenset({args.host}), runs=runs)
     print(f"Agentoscopy UI: http://{args.host}:{args.port}/#token={token}", flush=True)
@@ -455,8 +460,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         web.run_app(app, host=args.host, port=args.port, print=None)
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
     return EXIT_OK
 
 

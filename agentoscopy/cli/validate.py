@@ -14,8 +14,8 @@ from agentoscopy.cli.common import (
     EXIT_INVALID_INPUT,
     EXIT_OK,
 )
-from agentoscopy.gateway.credential_proxy import CredentialProxy
-from agentoscopy.gateway.server import Gateway
+from agentoscopy.cli.run import connect_models
+from agentoscopy.gateway.access import ModelAccess
 from agentoscopy.graders.judge import GatewayJudge
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
 from agentoscopy.sandbox.docker import DockerBackend
@@ -30,34 +30,29 @@ def validate_command(args: argparse.Namespace) -> int:
     if not task_ids:
         print("error: name one or more task ids, or pass --all", file=sys.stderr)
         return EXIT_INVALID_INPUT
-    try:
-        proxy = CredentialProxy.start_if_configured()  # only judges call a real model here
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_ENVIRONMENT
+    models, failure = connect_models(args)  # only judges call a real model here
+    if models is None:
+        return failure
     store = Store(args.home / DB_NAME)
     worst = EXIT_OK
     try:
         for task_id in task_ids:
-            worst = max(worst, _validate_one(store, args, task_id, proxy))
+            worst = max(worst, _validate_one(store, args, task_id, models))
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
     return worst
 
 
-def _validate_one(
-    store: Store, args: argparse.Namespace, task_id: str, proxy: CredentialProxy | None
-) -> int:
+def _validate_one(store: Store, args: argparse.Namespace, task_id: str, models: ModelAccess) -> int:
     try:
         task = load_task(args.tasks_dir, task_id)
-        judge_model = check_judge([task], args.judge_model, has_credentials=proxy is not None)
+        judge_model = check_judge([task], args.judge_model, models.providers)
     except (SpecError, PlanError) as exc:
         code = "" if isinstance(exc, PlanError) else "SCHEMA_INVALID "
         print(f"FAIL  {task_id}: {code}{exc}")
         return EXIT_INVALID_INPUT
-    report, judge_cost = asyncio.run(_validate(task, judge_model, proxy, args.home))
+    report, judge_cost = asyncio.run(_validate(task, judge_model, models, args.home))
     for problem in report.cleanup_errors:
         print(f"warning: {problem}", file=sys.stderr)
     if not report.ok:
@@ -76,12 +71,12 @@ def _validate_one(
 
 
 async def _validate(
-    task: Task, judge_model: str | None, proxy: CredentialProxy | None, home: Path
+    task: Task, judge_model: str | None, models: ModelAccess, home: Path
 ) -> tuple[ValidationReport, float]:
     """The report and the judge spend. Judge calls go through a gateway like a run's do."""
     if judge_model is None:
         return await validate_task(task, DockerBackend()), 0.0
-    gateway = Gateway(proxy.url if proxy else None, proxy.secret if proxy else None)
+    gateway = models.gateway()
     await gateway.start()
     log_dir = home / "validation" / task.spec.id / task.content_hash[:12]
     recorder = TrajectoryRecorder(

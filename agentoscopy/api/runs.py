@@ -17,7 +17,7 @@ from typing import Any
 from aiohttp import web
 
 from agentoscopy.api.common import HOME, STORE, ApiError, json_body
-from agentoscopy.gateway.credential_proxy import CredentialProxy
+from agentoscopy.gateway.access import OFFLINE, ModelAccess
 from agentoscopy.gateway.server import Gateway
 from agentoscopy.launch import (
     DEFAULT_CONCURRENCY,
@@ -69,7 +69,7 @@ class RunService:
     dirs: Directories
     configs_dir: Path
     backend: SandboxBackend
-    proxy: CredentialProxy | None = None
+    models: ModelAccess = OFFLINE
     gateway: Gateway | None = None
     running: set[asyncio.Task] = field(default_factory=set)
     _gateway_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
@@ -77,8 +77,7 @@ class RunService:
     async def start(self, store: Store, prepared: PreparedRun, home: Path) -> None:
         async with self._gateway_lock:  # one gateway for every run this server executes
             if self.gateway is None:
-                proxy = self.proxy
-                gateway = Gateway(proxy.url if proxy else None, proxy.secret if proxy else None)
+                gateway = self.models.gateway()
                 await gateway.start()
                 self.gateway = gateway
         task = asyncio.create_task(self._execute(store, prepared, home, self.gateway))
@@ -117,9 +116,7 @@ async def _create(request: web.Request) -> web.Response:
     service, store = request.app[RUNS], request.app[STORE]
     run_request = parse_request(await json_body(request), service.configs_dir)
     try:
-        prepared = create_run(
-            store, service.dirs, run_request, has_credentials=service.proxy is not None
-        )
+        prepared = create_run(store, service.dirs, run_request, providers=service.models.providers)
     except LaunchError as exc:
         match = ERROR_CODE.match(str(exc))
         code, message = match.groups() if match else ("INVALID_INPUT", str(exc))

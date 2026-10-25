@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agentoscopy.gateway.pricing import is_mock, price_for
+from agentoscopy.gateway.providers import Providers
 from agentoscopy.spec import Task, TaskSpec, load_task
 from agentoscopy.storage.store import NewTrial, Store
 
@@ -111,18 +111,20 @@ def check_budget(pinned: list[PinnedTask], budget_usd: float | None) -> None:
         )
 
 
-def check_judge(tasks: list[Task], judge_model: str, has_credentials: bool) -> str | None:
-    """The judge model to pin, or None when no task has llm_judge graders. A real judge model
-    needs provider credentials, which only the credential proxy holds."""
+def check_judge(tasks: list[Task], judge_model: str, providers: Providers) -> str | None:
+    """The judge model to pin, or None when no task has llm_judge graders. The judge's
+    provider must be reachable: its key set, or a server that needs none."""
     if not any(task.spec.has_judges() for task in tasks):
         return None
-    if price_for(judge_model) is None:
+    route = providers.route(judge_model)
+    if route is None:
         raise PlanError(
             f"UNKNOWN_JUDGE_MODEL: no price for {judge_model!r}, so judge spend cannot be tracked"
         )
-    if not is_mock(judge_model) and not has_credentials:
+    missing = providers.missing_key(route)
+    if missing:
         raise PlanError(
-            f"JUDGE_NEEDS_CREDENTIALS: judge model {judge_model!r} needs ANTHROPIC_API_KEY "
+            f"JUDGE_NEEDS_CREDENTIALS: judge model {judge_model!r} needs {missing} "
             "(or pass a mock judge model)"
         )
     return judge_model

@@ -259,7 +259,12 @@ def load_task(tasks_dir: Path, task_id: str) -> Task:
 
 
 def load_agent_config(path: Path) -> AgentConfig:
-    return _validate(AgentConfig, _read_yaml(path), path)
+    return load_spec(AgentConfig, path)
+
+
+def load_spec(model: type[SpecModel], path: Path) -> SpecModel:
+    """A YAML file validated as `model`; a SpecError names the file and each bad field."""
+    return _validate(model, _read_yaml(path), path)
 
 
 def load_suite(suites_dir: Path, name: str) -> SuiteSpec:

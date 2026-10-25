@@ -18,8 +18,8 @@ from agentoscopy.cli.common import (
     EXIT_INVALID_INPUT,
     EXIT_OK,
 )
-from agentoscopy.gateway.credential_proxy import CredentialProxy
-from agentoscopy.gateway.server import Gateway
+from agentoscopy.gateway.access import ModelAccess
+from agentoscopy.gateway.providers import Providers, load_providers
 from agentoscopy.launch import (
     DEFAULT_CONCURRENCY,
     Directories,
@@ -36,7 +36,7 @@ from agentoscopy.reporting import run_summary
 from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.scheduler.plan import TaskFilter, estimate_cost
 from agentoscopy.scheduler.runner import TrialProgress
-from agentoscopy.spec import config_hash
+from agentoscopy.spec import SpecError, config_hash
 from agentoscopy.stats.report import render
 from agentoscopy.storage.store import Store
 
@@ -44,29 +44,34 @@ EXIT_BY_STATUS = {"completed": EXIT_OK, "cancelled": EXIT_INTERRUPTED}
 
 
 def run_command(args: argparse.Namespace) -> int:
-    proxy, failure = start_proxy()
-    if failure is not None:
+    models, failure = connect_models(args)
+    if models is None:
         return failure
     store = Store(args.home / DB_NAME)
     try:
-        return _run(args, store, proxy)
+        return _run(args, store, models)
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
 
 
-def start_proxy() -> tuple[CredentialProxy | None, int | None]:
-    """Start the credential proxy first: it takes the API key out of this process before any
-    agent code is imported (NFR-SEC-01). Returns (proxy, exit code on failure)."""
+def connect_models(args: argparse.Namespace) -> tuple[ModelAccess | None, int]:
+    """Load the providers and start the credential proxy first: it takes the keys out of this
+    process before any agent code is imported (NFR-SEC-01). Returns the access, or None and
+    the exit code to fail with."""
     try:
-        return CredentialProxy.start_if_configured(), None
+        providers = load_providers(args.providers)
+    except SpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None, EXIT_INVALID_INPUT
+    try:
+        return ModelAccess.start(providers), EXIT_OK
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return None, EXIT_ENVIRONMENT
 
 
-def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
+def _run(args: argparse.Namespace, store: Store, models: ModelAccess) -> int:
     dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
     try:
         if args.resume and (args.tag or args.category or args.difficulty or args.failed_in):
@@ -76,15 +81,15 @@ def _run(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) 
                 store,
                 dirs,
                 args.resume,
-                has_credentials=proxy is not None,
+                providers=models.providers,
                 concurrency=args.concurrency,
             )
         else:
-            prepared = create_run(store, dirs, run_request(args), has_credentials=proxy is not None)
+            prepared = create_run(store, dirs, run_request(args), providers=models.providers)
     except (LaunchError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INVALID_INPUT
-    status = execute_with_progress(store, prepared, args.home, proxy, resumed=bool(args.resume))
+    status = execute_with_progress(store, prepared, args.home, models, resumed=bool(args.resume))
     if status is None:
         return EXIT_ENVIRONMENT
     print()
@@ -96,8 +101,8 @@ def replay_command(args: argparse.Namespace) -> int:
     """`agentoscopy replay <trial_id>`: rerun a trial against its recorded model calls."""
     return _from_recorded_trial(
         args,
-        lambda store, dirs, credentials: create_replay(
-            store, dirs, args.trial_id, has_credentials=credentials
+        lambda store, dirs, providers: create_replay(
+            store, dirs, args.trial_id, providers=providers
         ),
         _replay_verdict,
     )
@@ -107,14 +112,14 @@ def fork_command(args: argparse.Namespace) -> int:
     """`agentoscopy fork <trial_id> --at-step N`: replay up to step N, then go live."""
     return _from_recorded_trial(
         args,
-        lambda store, dirs, credentials: create_fork(
+        lambda store, dirs, providers: create_fork(
             store,
             dirs,
             args.trial_id,
             args.at_step,
             agent=args.agent,
             inject=args.inject,
-            has_credentials=credentials,
+            providers=providers,
         ),
         _fork_verdict,
     )
@@ -122,21 +127,21 @@ def fork_command(args: argparse.Namespace) -> int:
 
 def _from_recorded_trial(
     args: argparse.Namespace,
-    create: Callable[[Store, Directories, bool], PreparedRun],
+    create: Callable[[Store, Directories, Providers], PreparedRun],
     verdict: Callable[[dict[str, Any], dict[str, Any]], int],
 ) -> int:
-    proxy, failure = start_proxy()  # judges grade live, and a fork calls models live
-    if failure is not None:
+    models, failure = connect_models(args)  # judges grade live, and a fork calls models live
+    if models is None:
         return failure
     store = Store(args.home / DB_NAME)
     try:
         dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
         try:
-            prepared = create(store, dirs, proxy is not None)
+            prepared = create(store, dirs, models.providers)
         except LaunchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_INVALID_INPUT
-        status = execute_with_progress(store, prepared, args.home, proxy)
+        status = execute_with_progress(store, prepared, args.home, models)
         if status != "completed":
             return EXIT_BY_STATUS.get(status, EXIT_ENVIRONMENT)
         (rerun,) = store.trial_rows(prepared.run_id)
@@ -146,8 +151,7 @@ def _from_recorded_trial(
         return verdict(rerun, store.get_trial(args.trial_id))
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
 
 
 def _replay_verdict(replayed: dict[str, Any], source: dict[str, Any]) -> int:
@@ -200,7 +204,7 @@ def execute_with_progress(
     store: Store,
     prepared: PreparedRun,
     home: Path,
-    proxy: CredentialProxy | None,
+    models: ModelAccess,
     *,
     resumed: bool = False,
 ) -> str | None:
@@ -228,7 +232,7 @@ def execute_with_progress(
         flush=True,
     )
     try:
-        return asyncio.run(_execute(store, prepared, home, proxy))
+        return asyncio.run(_execute(store, prepared, home, models))
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)
         return "cancelled"
@@ -237,10 +241,8 @@ def execute_with_progress(
         return None
 
 
-async def _execute(
-    store: Store, prepared: PreparedRun, home: Path, proxy: CredentialProxy | None
-) -> str:
-    gateway = Gateway(proxy.url if proxy else None, proxy.secret if proxy else None)
+async def _execute(store: Store, prepared: PreparedRun, home: Path, models: ModelAccess) -> str:
+    gateway = models.gateway()
     await gateway.start()
     try:
         return await execute_run(

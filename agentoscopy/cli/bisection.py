@@ -17,8 +17,8 @@ from agentoscopy.cli.common import (
     EXIT_INVALID_INPUT,
     EXIT_OK,
 )
-from agentoscopy.cli.run import execute_with_progress, start_proxy
-from agentoscopy.gateway.credential_proxy import CredentialProxy
+from agentoscopy.cli.run import connect_models, execute_with_progress
+from agentoscopy.gateway.access import ModelAccess
 from agentoscopy.launch import Directories, LaunchError, create_fork, trial_recording
 from agentoscopy.storage.store import Store
 
@@ -32,24 +32,23 @@ class _Aborted(Exception):
 
 
 def bisect_command(args: argparse.Namespace) -> int:
-    proxy, failure = start_proxy()  # the rescue config calls models live
-    if failure is not None:
+    models, failure = connect_models(args)  # the rescue config calls models live
+    if models is None:
         return failure
     store = Store(args.home / DB_NAME)
     try:
-        return _bisect(args, store, proxy)
+        return _bisect(args, store, models)
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
 
 
-def _bisect(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
+def _bisect(args: argparse.Namespace, store: Store, models: ModelAccess) -> int:
     dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
     run_ids: list[str] = []
     try:
         recorded_calls = _failed_trial_calls(store, dirs, args.trial_id, args.budget_usd)
-        result = bisect_steps(recorded_calls, _prober(args, store, dirs, proxy, run_ids))
+        result = bisect_steps(recorded_calls, _prober(args, store, dirs, models, run_ids))
     except LaunchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INVALID_INPUT
@@ -83,7 +82,7 @@ def _prober(
     args: argparse.Namespace,
     store: Store,
     dirs: Directories,
-    proxy: CredentialProxy | None,
+    models: ModelAccess,
     run_ids: list[str],
 ) -> Callable[[int], Probe]:
     """Forks the trial at a step with the rescue config, within what is left of the budget."""
@@ -92,11 +91,11 @@ def _prober(
     def probe(step: int) -> Probe:
         remaining = args.budget_usd - sum(store.run_spent(run_id) for run_id in run_ids)
         prepared = create_fork(
-            store, dirs, args.trial_id, step, agent=args.agent, has_credentials=proxy is not None,
+            store, dirs, args.trial_id, step, agent=args.agent, providers=models.providers,
             trials=args.trials, budget_usd=max(remaining, 0.0), extra_labels={"bisect": search},
         )  # fmt: skip
         run_ids.append(prepared.run_id)
-        status = execute_with_progress(store, prepared, args.home, proxy)
+        status = execute_with_progress(store, prepared, args.home, models)
         if status == "cancelled":
             raise _Aborted(EXIT_INTERRUPTED)
         if status != "completed":

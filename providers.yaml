@@ -1,0 +1,35 @@
+# Model servers besides Anthropic. An agent or judge names one of their models as
+# <provider>/<model>, for example ollama/qwen3-coder; Claude models keep their plain names.
+# Each server must speak the Anthropic Messages API (POST /v1/messages), as Ollama, llama.cpp's
+# llama-server, LM Studio 0.4.1 or later, vLLM, and OpenRouter do.
+#
+#   base_url     where the server listens; the gateway adds /v1/messages
+#   api_key_env  the environment variable that holds its key. Leave it out for a server that
+#                needs none: the gateway then calls it directly. Keys are never written here.
+#   prices       USD per million tokens: input, output, and optionally cache_read. The price
+#                under "*" covers every model not listed. Every call is budgeted, so a model
+#                without a price is refused. Local models are counted as free.
+providers:
+  ollama:
+    base_url: http://localhost:11434
+    prices:
+      "*": {input: 0, output: 0}
+  llama-cpp:
+    base_url: http://localhost:8080
+    prices:
+      "*": {input: 0, output: 0}
+  lm-studio:
+    base_url: http://localhost:1234
+    prices:
+      "*": {input: 0, output: 0}
+  vllm:
+    base_url: http://localhost:8000
+    prices:
+      "*": {input: 0, output: 0}
+  openrouter:
+    base_url: https://openrouter.ai/api
+    api_key_env: OPENROUTER_API_KEY
+    prices:
+      # Add each model you use with OpenRouter's current price for it, for example:
+      # qwen/qwen3-coder: {input: 0.22, output: 0.95}
+      {}

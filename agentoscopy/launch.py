@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agentoscopy.adapters.python import AdapterLoadError, load_python_adapter
+from agentoscopy.gateway.providers import Providers
 from agentoscopy.gateway.server import Gateway
 from agentoscopy.replay import Playback, RecordedCall, load_recording
 from agentoscopy.reporting import run_summary
@@ -77,7 +78,7 @@ class PreparedRun:
 
 
 def create_run(
-    store: Store, dirs: Directories, request: RunRequest, *, has_credentials: bool
+    store: Store, dirs: Directories, request: RunRequest, *, providers: Providers
 ) -> PreparedRun:
     """Pin the tasks, check the plan, and record the run with its queued trials.
 
@@ -94,7 +95,7 @@ def create_run(
         pinned = pin_tasks(store, dirs.tasks, list(task_ids))
         check_budget(pinned, request.budget_usd)
         tasks = [item.task for item in pinned]
-        judge_model = check_judge(tasks, request.judge_model, has_credentials)
+        judge_model = check_judge(tasks, request.judge_model, providers)
         config = load_agent_config(request.agent)
         load_python_adapter(config.entrypoint)  # fail before the run exists if it cannot load
     except (SpecError, PlanError, AdapterLoadError) as exc:
@@ -128,7 +129,7 @@ def resume_run(
     dirs: Directories,
     run_id: str,
     *,
-    has_credentials: bool,
+    providers: Providers,
     concurrency: int | None = None,
 ) -> PreparedRun:
     """Pick up an unfinished run with the task versions and config it started with (WF-12).
@@ -148,7 +149,7 @@ def resume_run(
         config = AgentConfig.model_validate(store.config_spec(run["config_hash"]))
         load_python_adapter(config.entrypoint)
         if run["judge_model"]:
-            check_judge([item.task for item in pinned], run["judge_model"], has_credentials)
+            check_judge([item.task for item in pinned], run["judge_model"], providers)
     except (SpecError, PlanError, AdapterLoadError) as exc:
         raise LaunchError(str(exc)) from exc
     settings = RunSettings(
@@ -201,13 +202,13 @@ async def execute_run(
 
 
 def create_replay(
-    store: Store, dirs: Directories, trial_id: str, *, has_credentials: bool
+    store: Store, dirs: Directories, trial_id: str, *, providers: Providers
 ) -> PreparedRun:
     """A one-trial run that reruns a recorded trial (WF-11): same task version, config,
     and seed, with every model call answered from the trial's final attempt."""
     return _from_recorded_trial(
         store, dirs, trial_id, mode="replay", labels={"replay_of": trial_id},
-        has_credentials=has_credentials,
+        providers=providers,
     )  # fmt: skip
 
 
@@ -219,7 +220,7 @@ def create_fork(
     *,
     agent: Path | None = None,
     inject: str | None = None,
-    has_credentials: bool,
+    providers: Providers,
     trials: int = 1,
     budget_usd: float | None = None,
     extra_labels: dict[str, str] | None = None,
@@ -232,7 +233,7 @@ def create_fork(
     )
     return _from_recorded_trial(
         store, dirs, trial_id, mode="fork", labels=labels | (extra_labels or {}),
-        has_credentials=has_credentials, fork_at=at_step, inject=inject, agent=agent,
+        providers=providers, fork_at=at_step, inject=inject, agent=agent,
         trials=trials, budget_usd=budget_usd,
     )  # fmt: skip
 
@@ -244,7 +245,7 @@ def _from_recorded_trial(
     *,
     mode: str,
     labels: dict[str, str],
-    has_credentials: bool,
+    providers: Providers,
     fork_at: int | None = None,
     inject: str | None = None,
     agent: Path | None = None,
@@ -256,7 +257,7 @@ def _from_recorded_trial(
         raise LaunchError(f"NOT_FOUND: no trial {trial_id}")
     source = store.get_run(trial["run_id"])
     recording = trial_recording(dirs.home, trial, fork_at)
-    pinned, config = _task_and_config(store, dirs, source, trial["task_id"], agent, has_credentials)
+    pinned, config = _task_and_config(store, dirs, source, trial["task_id"], agent, providers)
     settings = RunSettings(
         suite_id=None,
         suite_version=None,
@@ -306,7 +307,7 @@ def _task_and_config(
     source: dict[str, Any],
     task_id: str,
     agent: Path | None,
-    has_credentials: bool,
+    providers: Providers,
 ) -> tuple[PinnedTask, AgentConfig]:
     """The source run's pinned task, and its agent config or the one given instead."""
     versions = {v.task_id: v for v in store.run_task_versions(source["run_id"])}
@@ -318,7 +319,7 @@ def _task_and_config(
             config = AgentConfig.model_validate(store.config_spec(source["config_hash"]))
         load_python_adapter(config.entrypoint)
         if source["judge_model"]:
-            check_judge([pinned.task], source["judge_model"], has_credentials)
+            check_judge([pinned.task], source["judge_model"], providers)
     except (SpecError, PlanError, AdapterLoadError) as exc:
         raise LaunchError(str(exc)) from exc
     return pinned, config

@@ -8,6 +8,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from agentoscopy.gateway.providers import Providers
 from agentoscopy.gateway.server import Gateway
 from agentoscopy.launch import Directories, resume_run
 from agentoscopy.sandbox.base import ExecResult
@@ -22,7 +23,7 @@ def passes_when_fixed(cmd, files):
 
 async def execute(store: Store, home: Path, tasks_dir: Path, run_id: str, lease_s: float) -> None:
     prepared = resume_run(
-        store, Directories(tasks_dir, tasks_dir, home), run_id, has_credentials=False
+        store, Directories(tasks_dir, tasks_dir, home), run_id, providers=Providers()
     )
     gateway = Gateway()
     await gateway.start()

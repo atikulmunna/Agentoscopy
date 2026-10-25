@@ -13,8 +13,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from agentoscopy.cli.common import DB_NAME
-from agentoscopy.cli.run import execute_with_progress, run_request, start_proxy
-from agentoscopy.gateway.credential_proxy import CredentialProxy
+from agentoscopy.cli.run import connect_models, execute_with_progress, run_request
+from agentoscopy.gateway.access import ModelAccess
 from agentoscopy.github import GitHubError, pull_request_from_env, upsert_comment
 from agentoscopy.launch import Directories, LaunchError, create_run
 from agentoscopy.reporting import NotFound, comparison
@@ -32,32 +32,31 @@ OVERRIDE_LABEL = "eval-override"
 
 
 def ci_command(args: argparse.Namespace) -> int:
-    proxy, failure = start_proxy()
-    if failure is not None:
+    models, _ = connect_models(args)
+    if models is None:
         return CI_HARNESS_ERROR
     store = Store(args.home / DB_NAME)
     try:
-        return _ci(args, store, proxy)
+        return _ci(args, store, models)
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
 
 
-def _ci(args: argparse.Namespace, store: Store, proxy: CredentialProxy | None) -> int:
+def _ci(args: argparse.Namespace, store: Store, models: ModelAccess) -> int:
     dirs = Directories(args.tasks_dir, args.suites_dir, args.home)
     try:
-        baseline_id = _find_baseline(store, dirs, args) or _run_baseline(store, dirs, args, proxy)
+        baseline_id = _find_baseline(store, dirs, args) or _run_baseline(store, dirs, args, models)
         if baseline_id is None:
             return CI_HARNESS_ERROR
         ci_labels = {"ci": "candidate"} | ({"override": OVERRIDE_LABEL} if args.override else {})
         candidate = create_run(
-            store, dirs, run_request(args, ci_labels), has_credentials=proxy is not None
+            store, dirs, run_request(args, ci_labels), providers=models.providers
         )
     except (LaunchError, PlanError, SpecError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return CI_HARNESS_ERROR
-    if execute_with_progress(store, candidate, args.home, proxy) != "completed":
+    if execute_with_progress(store, candidate, args.home, models) != "completed":
         print("error: the candidate run did not complete", file=sys.stderr)
         return CI_HARNESS_ERROR
     try:
@@ -95,7 +94,7 @@ def _find_baseline(store: Store, dirs: Directories, args: argparse.Namespace) ->
 
 
 def _run_baseline(
-    store: Store, dirs: Directories, args: argparse.Namespace, proxy: CredentialProxy | None
+    store: Store, dirs: Directories, args: argparse.Namespace, models: ModelAccess
 ) -> str | None:
     """No usable baseline exists, so run one with the baseline branch's agent config."""
     if args.baseline_agent is None:
@@ -111,9 +110,9 @@ def _run_baseline(
         agent=args.baseline_agent,
         labels={"branch": args.baseline, "ci": "baseline"},
     )
-    prepared = create_run(store, dirs, request, has_credentials=proxy is not None)
+    prepared = create_run(store, dirs, request, providers=models.providers)
     print(f"no recent baseline on branch {args.baseline}; running one first")
-    if execute_with_progress(store, prepared, args.home, proxy) != "completed":
+    if execute_with_progress(store, prepared, args.home, models) != "completed":
         print("error: the baseline run did not complete", file=sys.stderr)
         return None
     return prepared.run_id

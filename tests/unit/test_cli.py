@@ -94,6 +94,18 @@ def test_report_prints_a_stored_run(tasks_dir, tmp_path, capsys):
     assert agentoscopy(tmp_path, tasks_dir, "report", "missing-run") == EXIT_INVALID_INPUT
 
 
+def test_a_broken_or_missing_providers_file_stops_the_command(tasks_dir, tmp_path, capsys):
+    broken = tmp_path / "providers.yaml"
+    broken.write_text("providers:\n  local:\n    base_url: localhost:11434\n", encoding="utf-8")
+    run = ["run", "--task", "demo-task", "--agent", "configs/scripted-fix.yaml"]
+
+    assert agentoscopy(tmp_path, tasks_dir, *run, "--providers", str(broken)) == EXIT_INVALID_INPUT
+    assert "providers.local.base_url: Value error, must be an http" in capsys.readouterr().err
+    missing = ["--providers", str(tmp_path / "nope.yaml")]
+    assert agentoscopy(tmp_path, tasks_dir, *run, *missing) == EXIT_INVALID_INPUT
+    assert "cannot read file" in capsys.readouterr().err
+
+
 def test_tradeoff_refuses_runs_it_cannot_weigh(tasks_dir, tmp_path, capsys):
     store = Store(tmp_path / "home" / "agentoscopy.db")
     config = AgentConfig(name="agent", adapter="python", entrypoint="pkg.mod:Agent")

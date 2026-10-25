@@ -2,8 +2,10 @@
 
 It authenticates each trial by its own token, enforces the trial's step, token, and cost budgets,
 records model events into the trial's trajectory, retries provider overloads without charging the
-agent, and serves the mock provider in-process. Real provider calls go through the credential
-proxy, a separate process that alone holds the API key (NFR-SEC-01).
+agent, and serves the mock provider in-process. Each model is routed to its provider
+(FR-GW-09); calls that need a key go through the credential proxy, a separate process that
+alone holds provider keys (NFR-SEC-01), and keyless servers such as local ones are called
+directly.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from agentoscopy.adapters.base import BUDGET_EXCEEDED_ERROR
 from agentoscopy.gateway.credential_proxy import SECRET_HEADER
 from agentoscopy.gateway.mock import estimate_input_tokens, mock_message, sse_events
 from agentoscopy.gateway.pricing import Price, is_mock, price_for
+from agentoscopy.gateway.providers import ANTHROPIC, ANTHROPIC_ONLY, Providers, Route
 from agentoscopy.gateway.session import BudgetExhausted, TrialSession
 from agentoscopy.gateway.sse import MessageAccumulator
 from agentoscopy.recorder.trajectory import TrajectoryRecorder
@@ -58,16 +61,24 @@ class ProviderUnavailable(Exception):
     """The provider kept failing after every retry."""
 
 
+class NoRoute(Exception):
+    """A priced model whose provider this process cannot reach."""
+
+
 class Gateway:
     def __init__(
         self,
         upstream_url: str | None = None,
         upstream_secret: str | None = None,
         *,
+        providers: Providers = ANTHROPIC_ONLY,
         backoff_base_s: float = BACKOFF_BASE_S,
     ) -> None:
+        """`upstream_url` is the credential proxy, which adds provider keys; `providers` says
+        which server answers each model."""
         self.base_url = ""
         self._sessions: dict[str, TrialSession] = {}
+        self._providers = providers
         self._upstream_url = upstream_url
         self._upstream_secret = upstream_secret
         self._backoff_base_s = backoff_base_s
@@ -122,14 +133,16 @@ class Gateway:
         problem = _check_body(body)
         if problem:
             return _error(400, "invalid_request_error", problem)
-        price = price_for(body["model"])
-        if price is None:
+        route = self._providers.route(body["model"])
+        if route is None:
             return _error(
                 400,
                 "invalid_request_error",
-                f"model {body['model']!r} has no price in "
-                "agentoscopy.gateway.pricing.PRICES, so its cost cannot be budgeted",
+                f"model {body['model']!r} has no price, so its cost cannot be budgeted: Claude "
+                "models are priced in agentoscopy.gateway.pricing, and other models are named "
+                "<provider>/<model> and priced in the providers file",
             )
+        price = route.price
         requested = body["max_tokens"]
         try:
             body["max_tokens"] = session.admit(price, requested, estimate_input_tokens(body))
@@ -148,7 +161,7 @@ class Gateway:
             return await _serve_playback(request, session, call_index, body, requested)
         if is_mock(body["model"]):
             return await self._serve_mock(request, session, call_index, body, price)
-        return await self._serve_upstream(request, session, call_index, body, price)
+        return await self._serve_upstream(request, session, call_index, body, route)
 
     async def _serve_mock(
         self,
@@ -174,28 +187,19 @@ class Gateway:
         session: TrialSession,
         call_index: int,
         body: dict[str, Any],
-        price: Price,
+        route: Route,
     ) -> web.StreamResponse:
-        if self._upstream_url is None:
-            session.provider_error = (
-                "no provider credentials: set ANTHROPIC_API_KEY for agentoscopy run"
-            )
+        try:
+            url, headers = self._target(request, route)
+        except NoRoute as exc:
+            session.provider_error = str(exc)
             return _error(502, "api_error", session.provider_error)
-        headers = {
-            name: request.headers[name] for name in FORWARDED_HEADERS if name in request.headers
-        }
-        headers.update(
-            {"content-type": "application/json", SECRET_HEADER: self._upstream_secret or ""}
-        )
-        url = f"{self._upstream_url}/v1/messages"
-        if request.query_string:
-            url += f"?{request.query_string}"
+        price = route.price
+        payload = json.dumps({**body, "model": route.model}).encode()  # without the prefix
         started, backoff_before = time.monotonic(), session.backoff_s
         async with self._upstream_slots:
             try:
-                upstream = await self._post_with_retries(
-                    session, url, json.dumps(body).encode(), headers
-                )
+                upstream = await self._post_with_retries(session, url, payload, headers)
             except ProviderUnavailable as exc:
                 session.provider_error = str(exc)
                 session.recorder.write("error", {"source": "gateway", "message": str(exc)})
@@ -213,6 +217,29 @@ class Gateway:
                 return web.json_response(message)
             finally:
                 upstream.release()
+
+    def _target(self, request: web.Request, route: Route) -> tuple[str, dict[str, str]]:
+        """The URL for a call on this route, and its headers. Keyless providers are called
+        directly; the rest through the credential proxy, which adds their keys."""
+        missing = self._providers.missing_key(route)
+        if missing:
+            raise NoRoute(f"no credentials for {route.provider}: set {missing} for agentoscopy")
+        headers = {
+            name: request.headers[name] for name in FORWARDED_HEADERS if name in request.headers
+        }
+        headers["content-type"] = "application/json"
+        direct = self._providers.direct_url(route)
+        if direct:
+            url = f"{direct}/v1/messages"
+        elif self._upstream_url is None:
+            raise NoRoute("no provider credentials: set ANTHROPIC_API_KEY for agentoscopy run")
+        else:
+            prefix = "" if route.provider == ANTHROPIC else f"/providers/{route.provider}"
+            url = f"{self._upstream_url}{prefix}/v1/messages"
+            headers[SECRET_HEADER] = self._upstream_secret or ""
+        if request.query_string:
+            url += f"?{request.query_string}"
+        return url, headers
 
     async def _post_with_retries(
         self, session: TrialSession, url: str, payload: bytes, headers: dict[str, str]

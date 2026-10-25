@@ -16,9 +16,8 @@ from agentoscopy.cli.common import (
     EXIT_INVALID_INPUT,
     EXIT_OK,
 )
-from agentoscopy.cli.run import start_proxy
-from agentoscopy.gateway.credential_proxy import CredentialProxy
-from agentoscopy.gateway.server import Gateway
+from agentoscopy.cli.run import connect_models
+from agentoscopy.gateway.access import ModelAccess
 from agentoscopy.sandbox.docker import DockerBackend
 from agentoscopy.spec import AgentConfig, SpecError, load_agent_config
 from agentoscopy.storage.store import Store
@@ -31,8 +30,8 @@ def agent_check_command(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INVALID_INPUT
     # The proxy takes the API key out of this process before the agent's code is imported.
-    proxy, failure = start_proxy()
-    if failure is not None:
+    models, failure = connect_models(args)
+    if models is None:
         return failure
     store = Store(args.home / DB_NAME)
     try:
@@ -43,17 +42,14 @@ def agent_check_command(args: argparse.Namespace) -> int:
             return EXIT_INVALID_INPUT
         digest = store.save_config(config)
         print(f"checking agent {config.name} (config {digest[:12]}) on the smoke task", flush=True)
-        return _print(asyncio.run(_check(config, adapter, args.home, proxy)))
+        return _print(asyncio.run(_check(config, adapter, args.home, models)))
     finally:
         store.close()
-        if proxy:
-            proxy.stop()
+        models.stop()
 
 
-async def _check(
-    config: AgentConfig, adapter, home: Path, proxy: CredentialProxy | None
-) -> CheckReport:
-    gateway = Gateway(proxy.url if proxy else None, proxy.secret if proxy else None)
+async def _check(config: AgentConfig, adapter, home: Path, models: ModelAccess) -> CheckReport:
+    gateway = models.gateway()
     await gateway.start()
     try:
         return await check_agent(config, adapter, DockerBackend(), gateway, home / "checks")

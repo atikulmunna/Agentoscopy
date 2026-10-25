@@ -5,6 +5,8 @@ import pytest
 from conftest import BASE_TASK, running_gateway
 
 from agentoscopy.adapters.base import AgentResult
+from agentoscopy.gateway.pricing import Price
+from agentoscopy.gateway.providers import ANTHROPIC_ONLY, Provider, Providers
 from agentoscopy.sandbox.base import ExecResult
 from agentoscopy.scheduler.plan import (
     PlanError,
@@ -20,6 +22,14 @@ from agentoscopy.testing.fake_sandbox import FakeBackend, exit_with
 from agentoscopy.testing.scripted_agent import ScriptedAgent
 
 FIX = {"write": "app.py", "content": "fixed"}
+OFFLINE = Providers()
+LOCAL_AND_KEYED = Providers(
+    {
+        "local": Provider("http://localhost:11434", None, {"*": Price(0, 0, 0)}),
+        "hosted": Provider("https://example.com", "HOSTED_KEY", {"qwen3": Price(1, 2, 0)}),
+    },
+    reachable=frozenset({"local"}),  # HOSTED_KEY is not set
+)
 
 
 def passes_when_fixed(cmd, files):
@@ -244,20 +254,26 @@ def test_judge_model_is_only_pinned_for_tasks_with_judges(validated):
     plain = [item.task for item in validated("task-a")]
     judged = [item.task for item in validated("task-b", graders=[*BASE_TASK["graders"], JUDGE])]
 
-    assert check_judge(plain, "claude-opus-5-5", has_credentials=False) is None
-    assert check_judge(judged, "mock", has_credentials=False) == "mock"
-    assert check_judge(judged, "claude-opus-5-5", has_credentials=True) == "claude-opus-5-5"
+    assert check_judge(plain, "claude-opus-5-5", OFFLINE) is None
+    assert check_judge(judged, "mock", OFFLINE) == "mock"
+    assert check_judge(judged, "claude-opus-5-5", ANTHROPIC_ONLY) == "claude-opus-5-5"
+    assert check_judge(judged, "local/qwen3", LOCAL_AND_KEYED) == "local/qwen3"  # needs no key
 
 
 @pytest.mark.parametrize(
-    ("model", "credentials", "code"),
-    [("claude-opus-5-5", False, "JUDGE_NEEDS_CREDENTIALS"), ("gpt-x", True, "UNKNOWN_JUDGE_MODEL")],
+    ("model", "providers", "message"),
+    [
+        ("claude-opus-5-5", OFFLINE, "JUDGE_NEEDS_CREDENTIALS: .* needs ANTHROPIC_API_KEY"),
+        ("hosted/qwen3", LOCAL_AND_KEYED, "JUDGE_NEEDS_CREDENTIALS: .* needs HOSTED_KEY"),
+        ("gpt-x", ANTHROPIC_ONLY, "UNKNOWN_JUDGE_MODEL"),
+        ("hosted/unpriced", LOCAL_AND_KEYED, "UNKNOWN_JUDGE_MODEL"),
+    ],
 )
-def test_unusable_judge_models_are_rejected(validated, model, credentials, code):
+def test_unusable_judge_models_are_rejected(validated, model, providers, message):
     judged = [item.task for item in validated("task-b", graders=[*BASE_TASK["graders"], JUDGE])]
 
-    with pytest.raises(PlanError, match=code):
-        check_judge(judged, model, has_credentials=credentials)
+    with pytest.raises(PlanError, match=message):
+        check_judge(judged, model, providers)
 
 
 class PausingAgent:

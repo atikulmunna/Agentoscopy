@@ -9,6 +9,7 @@ from conftest import BASE_TASK
 from agentoscopy.api.common import ApiError
 from agentoscopy.api.runs import parse_request
 from agentoscopy.cli.main import main
+from agentoscopy.gateway.providers import Providers
 from agentoscopy.gateway.session import Usage
 from agentoscopy.launch import Directories, RunRequest, create_run
 from agentoscopy.sandbox.base import ExecResult
@@ -116,7 +117,7 @@ def test_a_resumed_run_still_gets_its_top_up(project):
     store, home, tasks_dir, agent, monkeypatch = project
     request = RunRequest(agent=agent, tasks=tuple(TASKS), trials=2, seed=1, top_up=1)
     prepared = create_run(
-        store, Directories(tasks_dir, tasks_dir, home), request, has_credentials=False
+        store, Directories(tasks_dir, tasks_dir, home), request, providers=Providers()
     )
     store.mark_running(prepared.run_id)
     # Its planned trials finished (round robin: each task passed once and failed once), then
