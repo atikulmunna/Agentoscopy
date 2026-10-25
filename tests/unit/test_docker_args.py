@@ -33,6 +33,17 @@ def test_dockerfile_bakes_fixtures_and_build_steps(make_task):
     assert lines[-1] == f"RUN chown -R {AGENT_USER} /workspace"
 
 
+def test_dockerfile_sets_the_task_environment_variables(make_task):
+    environment = {
+        "base_image": "img@sha256:abc",
+        "env": {"PATH": "/opt/env/bin:$PATH", "A": "b c"},
+    }
+
+    lines = render_dockerfile(make_task(environment=environment)).splitlines()
+
+    assert sorted(lines[2:4]) == ['ENV A="b c"', 'ENV PATH="/opt/env/bin:$PATH"']
+
+
 def test_dockerfile_skips_copy_without_fixtures(make_task):
     assert "COPY" not in render_dockerfile(make_task())
 

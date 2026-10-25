@@ -207,6 +207,8 @@ def task_image_tag(task: Task) -> str:
 def render_dockerfile(task: Task) -> str:
     environment = task.spec.environment
     lines = [f"FROM {environment.base_image}", f"WORKDIR {environment.workdir}"]
+    # A double-quoted value keeps its spaces and still expands $VAR, as in PATH=/x:$PATH.
+    lines += [f"ENV {name}={json.dumps(value)}" for name, value in environment.env.items()]
     if task.fixture_files():
         lines.append(f"COPY fixtures/ {environment.workdir}/")
     lines += [_run_step(step) for step in environment.build]

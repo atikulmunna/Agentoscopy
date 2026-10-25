@@ -58,6 +58,8 @@ def test_content_hash_ignores_pycache(write_task, tasks_dir):
         (with_environment(base_image="python:3.12-slim"), "environment.base_image"),
         (with_environment(workdir="workspace"), "environment.workdir"),
         (with_environment(network={"allow": ["pypi.org"]}), "environment.network.allow"),
+        (with_environment(env={"BAD-NAME": "x"}), "environment.env: Value error, 'BAD-NAME'"),
+        (with_environment(env={"PATH": "/x\nRUN rm -rf /"}), "PATH must fit on one line"),
         ({**BASE_TASK, "graders": [{"name": "j", "type": "llm_judge", "run": "x"}]}, "graders.0"),
         ({**BASE_TASK, "owner": "me"}, "owner: Extra inputs are not permitted"),
         ({**BASE_TASK, "graders": []}, "graders"),

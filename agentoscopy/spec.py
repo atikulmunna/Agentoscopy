@@ -54,6 +54,7 @@ class Environment(_Spec):
     workdir: str = "/workspace"
     build: list[str] = Field(default_factory=list)
     setup: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)  # set in the task image; $VAR expands
     network: Network = Field(default_factory=Network)
     resources: Resources = Field(default_factory=Resources)
 
@@ -70,6 +71,16 @@ class Environment(_Spec):
         if not workdir.startswith("/") or any(char.isspace() for char in workdir):
             raise ValueError("must be an absolute path without whitespace")
         return workdir
+
+    @field_validator("env")
+    @classmethod
+    def _one_line_variables(cls, env: dict[str, str]) -> dict[str, str]:
+        for name, value in env.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError(f"{name!r} is not a variable name")
+            if "\n" in value or "\r" in value:
+                raise ValueError(f"{name} must fit on one line")
+        return env
 
 
 class Budget(_Spec):
